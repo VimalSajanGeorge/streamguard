@@ -1,0 +1,45 @@
+{
+  "report_generated": "2025-10-16T20:55:51.267001",
+  "report_version": "1.0",
+  "collection_results": {
+    "start_time": "2025-10-16T20:51:29.616828",
+    "end_time": "2025-10-16T20:55:51.255769",
+    "total_duration": 261.6389410495758,
+    "mode": "parallel",
+    "collectors": {
+      "github": {
+        "collector": "github",
+        "status": "completed",
+        "message": "github collector completed successfully",
+        "samples_collected": 66,
+        "target_samples": 100,
+        "duration": 259.06437158584595,
+        "timestamp": "2025-10-16T20:55:51.095245",
+        "success": true
+      }
+    },
+    "summary": {
+      "total_collectors": 1,
+      "successful_collectors": 1,
+      "failed_collectors": 0,
+      "total_samples_collected": 66,
+      "total_target_samples": 100,
+      "total_duration": 259.06437158584595,
+      "by_collector": {
+        "github": {
+          "status": "completed",
+          "samples_collected": 66,
+          "target_samples": 100,
+          "duration": 259.06437158584595,
+          "success": true
+        }
+      },
+      "completion_rate": 66.0
+    }
+  },
+  "detailed_statistics": {
+    "overall_rate": 0.25225602784982304,
+    "expected_code_pairs": 23,
+    "code_pair_percentage": 35.0
+  }
+}

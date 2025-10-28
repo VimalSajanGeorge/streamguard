@@ -1,0 +1,41 @@
+Task Name,Status,Priority,Phase,Due Date,Notes,Related Issue
+Fix Unicode encoding errors in run_full_collection.py,Completed,High,Phase 5,2025-10-17,"Replaced emoji characters with ASCII equivalents at lines 203, 267, 289, 349",Unicode Encoding Errors - Windows cp1252 Compatibility
+Fix Unicode encoding errors in report_generator.py,Completed,High,Phase 5,2025-10-17,"Replaced emoji characters with ASCII equivalents at lines 86, 96",Unicode Encoding Errors - Windows cp1252 Compatibility
+Fix synthetic data saving bug,Completed,High,Phase 4,2025-10-17,Added save_samples() call in generate_samples() method,Synthetic Data Not Saving to Disk
+Fix orchestrator variable name error,Completed,Critical,Phase 5,2025-10-17,Changed 'name' to 'collector_name' at line 489,Master Orchestrator KeyError - Variable Name Bug
+Clean test data from all collectors,Completed,Medium,Phase 5,2025-10-17,"Removed all *.jsonl files from data/raw directories, cleaned checkpoints",N/A
+Run final verification test with all 3 collectors,Completed,High,Phase 5,2025-10-21,Verified synthetic (10), OSV (10), ExploitDB (10) - all successful,N/A
+Verify all data files created correctly,Completed,High,Phase 5,2025-10-21,"Confirmed file sizes: synthetic (3060B), OSV (22054B), ExploitDB (71953B)",N/A
+Generate new GitHub Personal Access Token,Completed,High,Phase 2,2025-10-16,Created new token with required scopes (public_repo read:org security_events),GitHub Personal Access Token Expired
+Create test_github_token.py validation script,Completed,Medium,Phase 2,2025-10-16,Script tests both Bearer and token auth formats,GitHub Personal Access Token Expired
+Implement OSV collector,Completed,High,Other,2025-10-16,"Added new collector for Open Source Vulnerabilities database, 482 lines of code",N/A
+Implement ExploitDB collector,Completed,High,Other,2025-10-16,"Added new collector for ExploitDB database, 518 lines of code",N/A
+Add debug logging to GitHub collector,Completed,Medium,Phase 2,2025-10-16,Added 15+ debug points for troubleshooting,GitHub Personal Access Token Expired
+Run full production data collection (80K samples),Not Started,High,Phase 5,,"Collect all 80,000 samples: CVE (15K) + GitHub (10K) + Repos (20K) + Synthetic (5K) + OSV (20K) + ExploitDB (10K)",N/A
+Set up data preprocessing pipeline,Not Started,High,Phase 6,,"Merge datasets, deduplicate, tokenize with CodeBERT",N/A
+Implement data tokenization with CodeBERT,Not Started,High,Phase 6,,Use CodeBERT tokenizer for code samples,N/A
+Create train/validation/test splits,Not Started,High,Phase 6,,"Split data 70/15/15, ensure balanced distribution",N/A
+Set up AWS SageMaker training environment,Not Started,High,Phase 6,,Configure SageMaker instance with GPU support,N/A
+Fine-tune CodeBERT model,Not Started,High,Phase 6,,"Train on collected data, optimize hyperparameters",N/A
+Implement model evaluation metrics,Not Started,High,Phase 6,,"Calculate precision, recall, F1-score, confusion matrix",N/A
+Create model evaluation report,Not Started,Medium,Phase 6,,Generate comprehensive evaluation documentation,N/A
+Deploy model to SageMaker endpoint,Not Started,High,Phase 6,,Create production endpoint for inference,N/A
+Create API integration for model inference,Not Started,High,Phase 6,,RESTful API for vulnerability detection,N/A
+Implement load testing for API,Not Started,Medium,Phase 6,,"Test API performance under load, optimize as needed",N/A
+Write Phase 6 completion documentation,Not Started,Medium,Phase 6,,Document model training process and results,N/A
+Integrate OSV and ExploitDB into master orchestrator,Not Started,Low,Phase 5,,Update orchestrator config to include new collectors,N/A
+Add progress dashboard for OSV and ExploitDB,Not Started,Low,Phase 5,,Extend Rich dashboard to show new collector progress,N/A
+Implement code extraction from OSV references,Not Started,Low,Other,,Parse OSV reference URLs to fetch actual code,OSV API Empty Results for Some Ecosystems
+Add filtering options for ExploitDB exploit types,Not Started,Low,Other,,"Allow filtering by type (remote, local, dos, etc.)",N/A
+Create unified deduplication across all sources,Not Started,Medium,Phase 6,,Deduplicate samples across all 6 collectors using hash comparison,N/A
+Implement automated token rotation for GitHub,Not Started,Low,Phase 2,,Auto-detect token expiration and notify user,GitHub Personal Access Token Expired
+Add unit tests for OSV collector,Not Started,Medium,Other,,Achieve >80% test coverage,N/A
+Add unit tests for ExploitDB collector,Not Started,Medium,Other,,Achieve >80% test coverage,N/A
+Create integration tests for master orchestrator,Not Started,Medium,Phase 5,,Test all collectors running in parallel,N/A
+Investigate OSV empty results issue,In Progress,Medium,Other,,"Debug why some ecosystems return 0 results, check query parameters and date ranges",OSV API Empty Results for Some Ecosystems
+Optimize ExploitDB 404 error handling,Not Started,Low,Other,,"Consider age-based filtering or archive.org fallback for old exploits",ExploitDB 404 Errors for Old Exploits
+Update project README with recent changes,Not Started,Low,Other,,"Document OSV/ExploitDB collectors, recent bug fixes, updated sample counts",N/A
+Create video tutorial for running collection,Not Started,Low,Other,,"Screen recording showing full collection process from setup to completion",N/A
+Write blog post about data collection pipeline,Not Started,Low,Other,,"Technical blog post covering architecture, challenges, and solutions",N/A
+Set up CI/CD pipeline for automated testing,Not Started,Medium,Other,,"GitHub Actions or similar for running tests on every commit",N/A
+Implement automated daily collection runs,Not Started,Low,Other,,"Scheduled task to collect new vulnerabilities daily",N/A

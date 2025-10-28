@@ -1,0 +1,55 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "StreamGuard Data Collector",
+          "version": "1.0.0",
+          "informationUri": "https://github.com/yourusername/streamguard",
+          "rules": []
+        }
+      },
+      "results": [
+        {
+          "ruleId": "collector-github",
+          "level": "note",
+          "message": {
+            "text": "github collector completed: 66 samples collected"
+          },
+          "properties": {
+            "collector": "github",
+            "status": "completed",
+            "samples_collected": 66,
+            "target_samples": 100,
+            "duration": 259.06437158584595,
+            "success": true
+          }
+        }
+      ],
+      "properties": {
+        "collection_summary": {
+          "start_time": "2025-10-16T20:51:29.616828",
+          "end_time": "2025-10-16T20:55:51.255769",
+          "total_duration": 261.6389410495758,
+          "mode": "parallel",
+          "total_samples_collected": 66,
+          "total_target_samples": 100,
+          "completion_rate": 66.0,
+          "successful_collectors": 1,
+          "failed_collectors": 0
+        },
+        "collectors": {
+          "github": {
+            "status": "completed",
+            "samples_collected": 66,
+            "target_samples": 100,
+            "duration": 259.06437158584595,
+            "success": true
+          }
+        }
+      }
+    }
+  ]
+}

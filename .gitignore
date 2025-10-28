@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+dist/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Data
+data/raw/*
+data/processed/*
+data/feedback/*
+!data/*/.gitkeep
+
+# Models
+models/*.pth
+models/*.onnx
+!models/.gitkeep
+
+# Graph DB
+neo4j/data/
+tigergraph/data/
+
+# Secrets
+.env
+secrets/
+*.pem
+*.key
+ARN.txt
+*.token
+config/credentials.json
+
+# Dashboard build
+dashboard/dist/
+dashboard/src-tauri/target/
+
+# Docker
+*.log
+docker-compose.override.yml

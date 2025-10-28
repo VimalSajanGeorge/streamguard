@@ -1,0 +1,16 @@
+StreamGuard Data Collection Report
+Generated:,2025-10-16 20:55:51
+
+SUMMARY
+Total Duration (s),261.6
+Mode,parallel
+Total Collectors,1
+Successful Collectors,1
+Failed Collectors,0
+Total Samples Collected,66
+Total Target Samples,100
+Completion Rate (%),66.0
+
+COLLECTOR DETAILS
+Collector,Status,Samples Collected,Target Samples,Duration (s),Success,Collection Rate (samples/s)
+GITHUB,completed,66,100,259.1,Yes,0.25

@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(dir \"C:\\Users\\Vimal Sajan\\streamguard\\data\\raw\\github\")",
+      "Bash(dir \"C:\\Users\\Vimal Sajan\\streamguard\\data\\raw\\opensource\")",
+      "Bash(dir \"C:\\Users\\Vimal Sajan\\streamguard\\data\\raw\\cves\")",
+      "Bash(dir \"C:\\Users\\Vimal Sajan\\streamguard\\training\\scripts\\collection\")",
+      "Bash(powershell:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

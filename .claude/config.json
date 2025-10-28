@@ -1,0 +1,100 @@
+{
+  "version": "1.0",
+  "project": {
+    "name": "StreamGuard",
+    "version": "3.0",
+    "description": "AI-Powered Real-Time Vulnerability Prevention System"
+  },
+  "context_files": [
+    "docs/claude.md",
+    "docs/01_setup.md",
+    "docs/02_ml_training.md",
+    "docs/03_explainability.md",
+    "docs/agent_architecture.md",
+    "docs/repository_graph.md",
+    "docs/ui_feedback.md",
+    "docs/verification_patch.md",
+    "docs/dataset_collection_guide.md",
+    "docs/ml_training_completion.md",
+    "docs/readme_md.md",
+    "README.md",
+    "requirements.txt",
+    ".gitignore"
+  ],
+  "coding_conventions": {
+    "python": {
+      "style": "PEP 8",
+      "naming": {
+        "classes": "PascalCase",
+        "functions": "snake_case",
+        "constants": "UPPER_SNAKE_CASE",
+        "private": "_leading_underscore"
+      },
+      "type_hints": "required",
+      "docstrings": "Google style",
+      "max_line_length": 100
+    },
+    "typescript": {
+      "style": "Airbnb",
+      "naming": {
+        "classes": "PascalCase",
+        "functions": "camelCase",
+        "constants": "UPPER_SNAKE_CASE"
+      },
+      "files": "kebab-case"
+    }
+  },
+  "performance_targets": {
+    "syntax_agent": {
+      "target": "50ms",
+      "maximum": "100ms"
+    },
+    "semantic_agent": {
+      "target": "200ms",
+      "maximum": "500ms"
+    },
+    "context_agent": {
+      "target": "500ms",
+      "maximum": "1000ms"
+    },
+    "verification_agent": {
+      "target": "300ms",
+      "maximum": "800ms"
+    },
+    "explainability_overhead": {
+      "target": "100ms",
+      "maximum": "200ms"
+    },
+    "graph_query": {
+      "target": "50ms",
+      "maximum": "100ms"
+    },
+    "patch_verification": {
+      "target": "5s",
+      "maximum": "10s"
+    },
+    "total_pipeline": {
+      "target": "1.5s",
+      "maximum": "3s"
+    }
+  },
+  "quality_metrics": {
+    "detection_accuracy": ">=95%",
+    "false_positive_rate": "<3%",
+    "false_negative_rate": "<5%",
+    "explainability_score": ">85%",
+    "patch_acceptance_rate": ">70%"
+  },
+  "security_practices": {
+    "never_execute_user_code": true,
+    "anonymize_feedback": true,
+    "sanitize_graph_queries": true,
+    "local_only_agent": true
+  },
+  "development": {
+    "test_coverage_minimum": "80%",
+    "documentation_required": true,
+    "type_checking": "strict",
+    "linting": ["black", "pylint", "mypy"]
+  }
+}
