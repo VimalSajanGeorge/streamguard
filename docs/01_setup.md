@@ -543,7 +543,7 @@ if __name__ == "__main__":
 
 ```bash
 # Run setup
-python scripts/setup_sagemaker_role.py
+ 
 ```
 
 ---

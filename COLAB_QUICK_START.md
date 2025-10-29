@@ -89,7 +89,7 @@ print(f"✓ CUDA: {torch.cuda.is_available()}")
 
 ```python
 # Cell 2: Clone StreamGuard
-!git clone https://github.com/YOUR_USERNAME/streamguard.git
+!git clone https://github.com/VimalSajanGeorge/streamguard.git
 %cd streamguard
 
 # Setup tree-sitter

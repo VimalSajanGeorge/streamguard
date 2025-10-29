@@ -307,8 +307,8 @@ If you use StreamGuard in your research, please cite:
 
 ## Contact
 
-- GitHub Issues: [https://github.com/YOUR_USERNAME/streamguard/issues](https://github.com/YOUR_USERNAME/streamguard/issues)
-- Email: your.email@example.com
+- GitHub Issues: [https://github.com/VimalSajanGeorge/streamguard/issues](https://github.com/YOUR_USERNAME/streamguard/issues)
+- Email: vimalsajan135@gmail.com
 
 ## Project Status
 

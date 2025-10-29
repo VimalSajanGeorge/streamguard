@@ -26,7 +26,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from transformers import (
     AutoModel, AutoTokenizer, AutoConfig,
     get_linear_schedule_with_warmup
@@ -407,7 +407,7 @@ def evaluate(
         model: Model instance
         dataloader: Data loader
         device: Device
-        criterion: Loss criterion (optional)
+        criterion: Loss criterion (optional, not used - we create eval-specific one)
 
     Returns:
         Metrics dictionary
@@ -417,6 +417,9 @@ def evaluate(
     all_preds = []
     all_labels = []
     total_loss = 0.0
+
+    # Create evaluation-specific criterion with mean reduction
+    eval_criterion = nn.CrossEntropyLoss(reduction='mean') if criterion is not None else None
 
     with torch.no_grad():
         for batch in dataloader:
@@ -430,8 +433,8 @@ def evaluate(
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
-            if criterion:
-                loss = criterion(logits, labels)
+            if eval_criterion:
+                loss = eval_criterion(logits, labels)  # Already reduced to scalar
                 total_loss += loss.item()
 
     all_preds = np.array(all_preds)
@@ -464,7 +467,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
-    scaler: Optional[GradScaler] = None,
+    scaler: Optional[torch.amp.GradScaler] = None,
     accumulation_steps: int = 1
 ) -> float:
     """
@@ -495,13 +498,22 @@ def train_epoch(
 
         # Mixed precision training
         if scaler:
-            with autocast():
+            with autocast(device_type='cuda'):
                 logits = model(input_ids, attention_mask)
-                loss = criterion(logits, labels)
+                loss = criterion(logits, labels)  # Shape: [batch_size]
 
-                # Apply sample weights
+                # Apply sample weights if available
                 if weights is not None and len(weights) > 0:
-                    loss = (loss * weights).mean()
+                    # Ensure weights are float and on same device
+                    weights = weights.to(device=loss.device, dtype=torch.float32)
+                    # Validate shapes match
+                    if weights.shape[0] == loss.shape[0]:
+                        loss = (loss * weights).mean()
+                    else:
+                        print(f"⚠️  Weight shape mismatch: {weights.shape} vs {loss.shape}, using unweighted")
+                        loss = loss.mean()
+                else:
+                    loss = loss.mean()
 
                 loss = loss / accumulation_steps
 
@@ -517,7 +529,13 @@ def train_epoch(
             loss = criterion(logits, labels)
 
             if weights is not None and len(weights) > 0:
-                loss = (loss * weights).mean()
+                weights = weights.to(device=loss.device, dtype=torch.float32)
+                if weights.shape[0] == loss.shape[0]:
+                    loss = (loss * weights).mean()
+                else:
+                    loss = loss.mean()
+            else:
+                loss = loss.mean()
 
             loss = loss / accumulation_steps
             loss.backward()
@@ -624,6 +642,18 @@ def main():
     print(f"[*] Loading tokenizer: {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
+    # CRITICAL: Validate max_seq_len against model's position embeddings limit
+    # CodeBERT/RoBERTa has max position embeddings of 514 (512 + 2 special tokens)
+    model_config = AutoConfig.from_pretrained(args.model_name)
+    max_position_embeddings = getattr(model_config, 'max_position_embeddings', 512)
+
+    if args.max_seq_len > max_position_embeddings:
+        print(f"\n[!] WARNING: max_seq_len ({args.max_seq_len}) exceeds model limit ({max_position_embeddings})")
+        print(f"    This will cause tensor size mismatch errors during training!")
+        print(f"    Automatically reducing max_seq_len to {max_position_embeddings}")
+        args.max_seq_len = max_position_embeddings
+        print(f"[+] Updated max_seq_len: {args.max_seq_len}\n")
+
     # Load datasets
     train_dataset = CodeDataset(
         args.train_data, tokenizer, args.max_seq_len, args.use_weights
@@ -673,7 +703,7 @@ def main():
     criterion = nn.CrossEntropyLoss(reduction='none')  # For weighted loss
 
     # Mixed precision
-    scaler = GradScaler() if args.mixed_precision else None
+    scaler = GradScaler('cuda') if args.mixed_precision and torch.cuda.is_available() else None
 
     # Checkpoint manager
     checkpoint_mgr = S3CheckpointManager(

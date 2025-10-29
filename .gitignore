@@ -49,3 +49,6 @@ dashboard/src-tauri/target/
 # Docker
 *.log
 docker-compose.override.yml
+
+# Vendor (will be cloned during setup)
+vendor/tree-sitter-c/
