@@ -688,7 +688,7 @@ def main():
     for sample in train_dataset.samples:
         train_labels.append(sample['label'])
 
-    class_counts = torch.bincount(torch.tensor(train_labels))
+    class_counts = torch.bincount(torch.tensor(train_labels, dtype=torch.long))
     num_safe = class_counts[0].item()
     num_vulnerable = class_counts[1].item()
     total = len(train_labels)
