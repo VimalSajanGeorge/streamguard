@@ -678,9 +678,9 @@ def main():
 
     # Quick test mode
     if args.quick_test:
-        print("[*] Quick test mode: using 100 samples")
-        train_dataset.samples = train_dataset.samples[:100]
-        val_dataset.samples = val_dataset.samples[:50]
+        print("[*] Quick test mode: using 500 train, 100 val samples")
+        train_dataset.samples = train_dataset.samples[:500]
+        val_dataset.samples = val_dataset.samples[:100]
 
     # CRITICAL FIX: Calculate class weights for imbalanced dataset
     print("\n[*] Calculating class weights for balanced training...")
@@ -693,9 +693,16 @@ def main():
     num_vulnerable = class_counts[1].item()
     total = len(train_labels)
 
-    # Inverse frequency weighting
-    weight_safe = total / (2.0 * num_safe)
-    weight_vulnerable = total / (2.0 * num_vulnerable)
+    # Inverse frequency weighting (gentler for quick test)
+    if args.quick_test:
+        # Use gentler weights for quick test to reduce oscillation
+        weight_safe = 1.0
+        weight_vulnerable = 1.15  # Only 15% higher instead of 56%
+        print(f"[*] Quick test mode: using gentler class weights (1.0 vs 1.15)")
+    else:
+        # Original inverse frequency weights for full training
+        weight_safe = total / (2.0 * num_safe)
+        weight_vulnerable = total / (2.0 * num_vulnerable)
 
     class_weights = torch.tensor(
         [weight_safe, weight_vulnerable],
@@ -714,11 +721,16 @@ def main():
     )
 
     # Model
+    # Disable dropout for quick test to reduce noise
+    dropout_val = 0.0 if args.quick_test else args.dropout
+    if args.quick_test:
+        print(f"[*] Quick test mode: dropout set to 0.0 (disabled)")
+
     print(f"[*] Initializing model: {args.model_name}")
     model = EnhancedSQLIntentTransformer(
         model_name=args.model_name,
         hidden_dim=args.hidden_dim,
-        dropout=args.dropout
+        dropout=dropout_val
     )
     model.to(device)
 
@@ -733,6 +745,11 @@ def main():
         print(f"[*] Scaling LR: {base_lr:.2e} -> {scaled_lr:.2e} (batch {args.batch_size} vs base {base_batch})")
     else:
         scaled_lr = base_lr
+
+    # Reduce LR for quick test to prevent oscillation
+    if args.quick_test:
+        scaled_lr = scaled_lr * 0.25  # Reduce by 75%
+        print(f"[*] Quick test mode: reduced LR to {scaled_lr:.2e} (75% reduction)")
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -760,12 +777,15 @@ def main():
     )
 
     # CRITICAL FIX: Use class-balanced loss with conservative label smoothing
+    # Disable label smoothing for quick test to reduce noise
+    label_smoothing_val = 0.0 if args.quick_test else 0.05
+
     criterion = nn.CrossEntropyLoss(
-        weight=class_weights,      # Class balancing
-        label_smoothing=0.05,      # Conservative smoothing (not 0.1)
-        reduction='mean'           # Simple mean (not 'none')
+        weight=class_weights,                  # Class balancing
+        label_smoothing=label_smoothing_val,   # 0.0 for quick test, 0.05 for full
+        reduction='mean'                       # Simple mean (not 'none')
     )
-    print(f"[+] Loss: CrossEntropyLoss with class_weights and label_smoothing=0.05")
+    print(f"[+] Loss: CrossEntropyLoss with class_weights and label_smoothing={label_smoothing_val}")
 
     # Mixed precision
     scaler = GradScaler('cuda') if args.mixed_precision and torch.cuda.is_available() else None
@@ -784,6 +804,11 @@ def main():
 
     best_val_f1 = 0.0
     patience_counter = 0
+
+    # Increase patience for quick test (needs more time to stabilize)
+    effective_patience = args.early_stopping_patience * 3 if args.quick_test else args.early_stopping_patience
+    if args.quick_test:
+        print(f"[*] Quick test mode: increased patience to {effective_patience} (3x normal)")
 
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
@@ -828,10 +853,10 @@ def main():
             print(f"[+] New best model! F1: {best_val_f1:.4f}")
         else:
             patience_counter += 1
-            print(f"[*] No improvement. Patience: {patience_counter}/{args.early_stopping_patience}")
+            print(f"[*] No improvement. Patience: {patience_counter}/{effective_patience}")
 
         # CRITICAL FIX: Early stopping with collapse detection
-        if patience_counter >= args.early_stopping_patience:
+        if patience_counter >= effective_patience:
             print(f"\n[!] Early stopping triggered at epoch {epoch + 1}")
             break
 
