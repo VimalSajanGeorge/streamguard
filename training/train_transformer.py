@@ -296,12 +296,20 @@ class S3CheckpointManager:
             metrics: Metrics dictionary
             is_best: Whether this is the best checkpoint
         """
+        # CRITICAL FIX: Save state_dicts only (PyTorch 2.6 compatibility)
+        # Remove prediction_distribution from metrics to avoid serialization issues
+        metrics_to_save = {
+            k: float(v) if isinstance(v, (np.floating, np.integer, torch.Tensor)) else v
+            for k, v in metrics.items()
+            if k != 'prediction_distribution'
+        }
+
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-            'metrics': metrics
+            'metrics': metrics_to_save
         }
 
         # Save locally
@@ -357,7 +365,8 @@ class S3CheckpointManager:
         # Try local first
         if local_path.exists():
             print(f"[*] Loading checkpoint from {local_path}")
-            return torch.load(local_path)
+            # CRITICAL FIX: Use weights_only=True for PyTorch 2.6+
+            return torch.load(local_path, weights_only=True)
 
         # Try S3
         if self.s3_client:
@@ -369,7 +378,8 @@ class S3CheckpointManager:
                     s3_key,
                     str(local_path)
                 )
-                return torch.load(local_path)
+                # CRITICAL FIX: Use weights_only=True for PyTorch 2.6+
+                return torch.load(local_path, weights_only=True)
             except Exception as e:
                 print(f"[!] S3 download failed: {e}")
 
@@ -440,10 +450,18 @@ def evaluate(
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
 
+    # CRITICAL FIX: Add prediction distribution monitoring to detect collapse
+    pred_distribution = {
+        'predicted_vulnerable': int((all_preds == 1).sum()),
+        'predicted_safe': int((all_preds == 0).sum()),
+        'actual_vulnerable': int((all_labels == 1).sum()),
+        'actual_safe': int((all_labels == 0).sum())
+    }
+
     # Compute metrics
     accuracy = accuracy_score(all_labels, all_preds)
     precision, recall, f1, _ = precision_recall_fscore_support(
-        all_labels, all_preds, average='binary', pos_label=1
+        all_labels, all_preds, average='binary', pos_label=1, zero_division=0
     )
 
     # Binary F1 for vulnerable class (early stopping metric)
@@ -455,7 +473,8 @@ def evaluate(
         'precision': precision,
         'recall': recall,
         'f1': f1,
-        'binary_f1_vulnerable': binary_f1
+        'binary_f1_vulnerable': binary_f1,
+        'prediction_distribution': pred_distribution
     }
 
     return metrics
@@ -467,6 +486,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
+    scheduler: Any,
     scaler: Optional[torch.amp.GradScaler] = None,
     accumulation_steps: int = 1
 ) -> float:
@@ -479,6 +499,7 @@ def train_epoch(
         optimizer: Optimizer
         criterion: Loss criterion
         device: Device
+        scheduler: LR scheduler (stepped per-step, not per-epoch)
         scaler: GradScaler for mixed precision (optional)
         accumulation_steps: Gradient accumulation steps
 
@@ -486,7 +507,7 @@ def train_epoch(
         Average loss
     """
     model.train()
-    total_loss = 0.0
+    running_loss = 0.0
 
     optimizer.zero_grad()
 
@@ -494,59 +515,52 @@ def train_epoch(
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         labels = batch['label'].to(device)
-        weights = batch['weight'].to(device)
+        # Note: weights removed - using class_weights in criterion instead
 
         # Mixed precision training
         if scaler:
             with autocast(device_type='cuda'):
                 logits = model(input_ids, attention_mask)
-                loss = criterion(logits, labels)  # Shape: [batch_size]
-
-                # Apply sample weights if available
-                if weights is not None and len(weights) > 0:
-                    # Ensure weights are float and on same device
-                    weights = weights.to(device=loss.device, dtype=torch.float32)
-                    # Validate shapes match
-                    if weights.shape[0] == loss.shape[0]:
-                        loss = (loss * weights).mean()
-                    else:
-                        print(f"⚠️  Weight shape mismatch: {weights.shape} vs {loss.shape}, using unweighted")
-                        loss = loss.mean()
-                else:
-                    loss = loss.mean()
-
+                loss = criterion(logits, labels)  # Already reduced to scalar with class weights
                 loss = loss / accumulation_steps
+
+            # Track loss before dividing (for accurate reporting)
+            running_loss += loss.detach().item() * accumulation_steps
 
             scaler.scale(loss).backward()
 
             if (step + 1) % accumulation_steps == 0:
+                # CRITICAL FIX: Add gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
 
+                # CRITICAL FIX: Step scheduler per-step (not per-epoch)
+                scheduler.step()
+
         else:
             logits = model(input_ids, attention_mask)
-            loss = criterion(logits, labels)
-
-            if weights is not None and len(weights) > 0:
-                weights = weights.to(device=loss.device, dtype=torch.float32)
-                if weights.shape[0] == loss.shape[0]:
-                    loss = (loss * weights).mean()
-                else:
-                    loss = loss.mean()
-            else:
-                loss = loss.mean()
-
+            loss = criterion(logits, labels)  # Already reduced to scalar
             loss = loss / accumulation_steps
+
+            running_loss += loss.detach().item() * accumulation_steps
+
             loss.backward()
 
             if (step + 1) % accumulation_steps == 0:
+                # CRITICAL FIX: Add gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
                 optimizer.step()
                 optimizer.zero_grad()
 
-        total_loss += loss.item() * accumulation_steps
+                # CRITICAL FIX: Step scheduler per-step (not per-epoch)
+                scheduler.step()
 
-    return total_loss / len(dataloader)
+    return running_loss / len(dataloader)
 
 
 def save_experiment_config(args: argparse.Namespace, output_dir: Path, data_paths: Dict[str, Path]):
@@ -668,6 +682,29 @@ def main():
         train_dataset.samples = train_dataset.samples[:100]
         val_dataset.samples = val_dataset.samples[:50]
 
+    # CRITICAL FIX: Calculate class weights for imbalanced dataset
+    print("\n[*] Calculating class weights for balanced training...")
+    train_labels = []
+    for sample in train_dataset.samples:
+        train_labels.append(sample['label'])
+
+    class_counts = torch.bincount(torch.tensor(train_labels))
+    num_safe = class_counts[0].item()
+    num_vulnerable = class_counts[1].item()
+    total = len(train_labels)
+
+    # Inverse frequency weighting
+    weight_safe = total / (2.0 * num_safe)
+    weight_vulnerable = total / (2.0 * num_vulnerable)
+
+    class_weights = torch.tensor(
+        [weight_safe, weight_vulnerable],
+        dtype=torch.float32
+    ).to(device)
+
+    print(f"    Class distribution: Safe={num_safe}, Vulnerable={num_vulnerable}")
+    print(f"    Class weights: Safe={weight_safe:.4f}, Vulnerable={weight_vulnerable:.4f}\n")
+
     # Data loaders
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0
@@ -685,22 +722,50 @@ def main():
     )
     model.to(device)
 
+    # CRITICAL FIX: Learning rate scaling for large batch sizes
+    import math
+    base_lr = args.lr  # 2e-5
+    base_batch = 16
+
+    if args.batch_size > base_batch:
+        scale_factor = math.sqrt(args.batch_size / base_batch)
+        scaled_lr = base_lr * scale_factor
+        print(f"[*] Scaling LR: {base_lr:.2e} -> {scaled_lr:.2e} (batch {args.batch_size} vs base {base_batch})")
+    else:
+        scaled_lr = base_lr
+
     # Optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay
+        lr=scaled_lr,
+        weight_decay=args.weight_decay,
+        eps=1e-8,
+        betas=(0.9, 0.999)
     )
 
-    # Scheduler
-    total_steps = len(train_loader) * args.epochs // args.accumulation_steps
-    warmup_steps = int(total_steps * args.warmup_ratio)
+    # Adjust warmup ratio proportionally (capped at 20%)
+    if args.batch_size > base_batch:
+        adjusted_warmup_ratio = min(args.warmup_ratio * scale_factor, 0.2)
+    else:
+        adjusted_warmup_ratio = args.warmup_ratio
+
+    # CRITICAL FIX: Account for gradient accumulation in total_steps
+    total_steps = math.ceil(len(train_loader) / args.accumulation_steps) * args.epochs
+    warmup_steps = int(total_steps * adjusted_warmup_ratio)
+
+    print(f"[*] Scheduler config: total_steps={total_steps}, warmup_steps={warmup_steps} ({adjusted_warmup_ratio:.1%})")
+
     scheduler = get_linear_schedule_with_warmup(
         optimizer, warmup_steps, total_steps
     )
 
-    # Loss
-    criterion = nn.CrossEntropyLoss(reduction='none')  # For weighted loss
+    # CRITICAL FIX: Use class-balanced loss with conservative label smoothing
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights,      # Class balancing
+        label_smoothing=0.05,      # Conservative smoothing (not 0.1)
+        reduction='mean'           # Simple mean (not 'none')
+    )
+    print(f"[+] Loss: CrossEntropyLoss with class_weights and label_smoothing=0.05")
 
     # Mixed precision
     scaler = GradScaler('cuda') if args.mixed_precision and torch.cuda.is_available() else None
@@ -724,22 +789,32 @@ def main():
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
         print("-" * 70)
 
-        # Train
+        # Train (CRITICAL FIX: Pass scheduler to train_epoch)
         train_loss = train_epoch(
             model, train_loader, optimizer, criterion,
-            device, scaler, args.accumulation_steps
+            device, scheduler, scaler, args.accumulation_steps
         )
 
         # Evaluate
         val_metrics = evaluate(model, val_loader, device, criterion)
 
+        # CRITICAL FIX: Print prediction distribution to detect collapse
+        dist = val_metrics['prediction_distribution']
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Val Loss: {val_metrics['loss']:.4f}")
         print(f"Val Accuracy: {val_metrics['accuracy']:.4f}")
+        print(f"Val Precision: {val_metrics['precision']:.4f}")
+        print(f"Val Recall: {val_metrics['recall']:.4f}")
         print(f"Val F1 (vulnerable): {val_metrics['binary_f1_vulnerable']:.4f}")
+        print(f"Predictions: Vulnerable={dist['predicted_vulnerable']}/{dist['actual_vulnerable']}, "
+              f"Safe={dist['predicted_safe']}/{dist['actual_safe']}")
 
-        # Step scheduler
-        scheduler.step()
+        # CRITICAL FIX: Detect model collapse
+        if dist['predicted_vulnerable'] == 0 or dist['predicted_safe'] == 0:
+            print(f"[!] CRITICAL: Model collapse detected! Only predicting one class.")
+
+        # CRITICAL FIX: Scheduler now steps inside train_epoch (per-step, not per-epoch)
+        # scheduler.step() <- REMOVED
 
         # Save checkpoint
         is_best = val_metrics['binary_f1_vulnerable'] > best_val_f1
@@ -755,10 +830,25 @@ def main():
             patience_counter += 1
             print(f"[*] No improvement. Patience: {patience_counter}/{args.early_stopping_patience}")
 
-        # Early stopping
+        # CRITICAL FIX: Early stopping with collapse detection
         if patience_counter >= args.early_stopping_patience:
             print(f"\n[!] Early stopping triggered at epoch {epoch + 1}")
             break
+
+        # Additional collapse detection for consecutive epochs
+        if epoch >= 2:  # Check after 3rd epoch
+            # Check for absolute collapse (predicting only one class)
+            if dist['predicted_vulnerable'] == 0 or dist['predicted_safe'] == 0:
+                print(f"\n[!] STOPPING: Complete collapse detected (predicting only one class)")
+                break
+
+            # Check for severe under-prediction (< 20% of actual)
+            actual_vuln = dist['actual_vulnerable']
+            pred_vuln = dist['predicted_vulnerable']
+            if pred_vuln < 0.2 * actual_vuln:
+                print(f"\n[!] WARNING: Severe under-prediction of vulnerable class")
+                print(f"    Predicted: {pred_vuln}, Actual: {actual_vuln} ({100*pred_vuln/actual_vuln:.1f}%)")
+                print(f"    Consider reducing class weights or label smoothing")
 
     print("\n" + "="*70)
     print("TRAINING COMPLETE")
