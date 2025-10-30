@@ -693,12 +693,12 @@ def main():
     num_vulnerable = class_counts[1].item()
     total = len(train_labels)
 
-    # Inverse frequency weighting (gentler for quick test)
+    # Inverse frequency weighting (balanced for quick test)
     if args.quick_test:
-        # Use gentler weights for quick test to reduce oscillation
+        # Use moderate weights for quick test - balanced between learning and stability
         weight_safe = 1.0
-        weight_vulnerable = 1.15  # Only 15% higher instead of 56%
-        print(f"[*] Quick test mode: using gentler class weights (1.0 vs 1.15)")
+        weight_vulnerable = 1.4  # 40% higher - moderate strength
+        print(f"[*] Quick test mode: using balanced class weights (1.0 vs 1.4)")
     else:
         # Original inverse frequency weights for full training
         weight_safe = total / (2.0 * num_safe)
@@ -746,10 +746,10 @@ def main():
     else:
         scaled_lr = base_lr
 
-    # Reduce LR for quick test to prevent oscillation
+    # Reduce LR for quick test to prevent oscillation (but not too much)
     if args.quick_test:
-        scaled_lr = scaled_lr * 0.25  # Reduce by 75%
-        print(f"[*] Quick test mode: reduced LR to {scaled_lr:.2e} (75% reduction)")
+        scaled_lr = scaled_lr * 0.75  # Reduce by 25% (was 75%, too aggressive)
+        print(f"[*] Quick test mode: reduced LR to {scaled_lr:.2e} (25% reduction)")
 
     # Optimizer
     optimizer = torch.optim.AdamW(
