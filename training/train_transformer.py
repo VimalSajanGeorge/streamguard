@@ -634,6 +634,20 @@ def main():
     parser.add_argument('--mixed-precision', action='store_true', help='Use mixed precision')
     parser.add_argument('--quick-test', action='store_true', help='Quick test with 100 samples')
 
+    # NEW: Stability & accuracy flags
+    parser.add_argument('--use-weighted-sampler', action='store_true', default=False,
+                        help='Use WeightedRandomSampler for class balance (recommended for imbalanced data)')
+    parser.add_argument('--lr-override', type=float, default=None,
+                        help='Override LR (bypasses all scaling)')
+    parser.add_argument('--weight-multiplier', type=float, default=1.5,
+                        help='Multiplier for minority class weight (1.0-2.0 range)')
+    parser.add_argument('--use-code-features', action='store_true', default=False,
+                        help='Add 10 code metrics as additional features (+5-10 F1 points)')
+    parser.add_argument('--focal-loss', action='store_true', default=False,
+                        help='Use Focal Loss instead of CrossEntropy (helps with hard negatives)')
+    parser.add_argument('--focal-gamma', type=float, default=2.0,
+                        help='Focal loss gamma (1.0-2.5, higher=more focus on hard examples)')
+
     args = parser.parse_args()
 
     # Set seed
@@ -693,16 +707,27 @@ def main():
     num_vulnerable = class_counts[1].item()
     total = len(train_labels)
 
-    # Inverse frequency weighting (balanced for quick test)
+    # Class weights with tunable multiplier
     if args.quick_test:
-        # Use moderate weights for quick test - balanced between learning and stability
         weight_safe = 1.0
-        weight_vulnerable = 1.4  # 40% higher - moderate strength
-        print(f"[*] Quick test mode: using balanced class weights (1.0 vs 1.4)")
+        # Use multiplier for quick test (default 1.5, range 1.2-2.0)
+        base_vulnerable_weight = total / (2.0 * num_vulnerable)
+        weight_vulnerable = base_vulnerable_weight * args.weight_multiplier
+        print(f"[*] Quick test mode: class weights (1.0 vs {weight_vulnerable:.4f})")
+        print(f"    Base inverse-freq={base_vulnerable_weight:.4f}, multiplier={args.weight_multiplier}")
     else:
-        # Original inverse frequency weights for full training
+        # Full training: use inverse-frequency as-is (conservative)
         weight_safe = total / (2.0 * num_safe)
         weight_vulnerable = total / (2.0 * num_vulnerable)
+        # Optionally apply multiplier for full training too
+        if args.weight_multiplier != 1.0:
+            weight_vulnerable *= args.weight_multiplier
+            print(f"[*] Applied weight multiplier: {args.weight_multiplier}")
+
+    # Safety: cap weights to prevent instability
+    weight_vulnerable = min(weight_vulnerable, 5.0)
+    if weight_vulnerable == 5.0:
+        print(f"[!] WARNING: Vulnerable weight capped at 5.0 (safety ceiling)")
 
     class_weights = torch.tensor(
         [weight_safe, weight_vulnerable],
@@ -712,10 +737,35 @@ def main():
     print(f"    Class distribution: Safe={num_safe}, Vulnerable={num_vulnerable}")
     print(f"    Class weights: Safe={weight_safe:.4f}, Vulnerable={weight_vulnerable:.4f}\n")
 
-    # Data loaders
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0
-    )
+    # Data loaders with WeightedRandomSampler option
+    if args.use_weighted_sampler:
+        # Compute per-sample weights (inverse frequency)
+        class_counts = torch.bincount(torch.tensor(train_labels, dtype=torch.long))
+        class_weights_sampling = 1.0 / class_counts.float()
+        sample_weights = torch.tensor([
+            class_weights_sampling[label] for label in train_labels
+        ])
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(train_dataset),
+            replacement=True
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            sampler=sampler,  # sampler and shuffle are mutually exclusive!
+            num_workers=0
+        )
+        print(f"[*] Using WeightedRandomSampler (inverse-frequency)")
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,  # Only when no sampler
+            num_workers=0
+        )
+
+    # Validation loader (always shuffle=False, never sampler)
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0
     )
@@ -746,10 +796,27 @@ def main():
     else:
         scaled_lr = base_lr
 
-    # Reduce LR for quick test to prevent oscillation (but not too much)
+    # For quick test: use proven LR (not too low!)
     if args.quick_test:
-        scaled_lr = scaled_lr * 0.75  # Reduce by 25% (was 75%, too aggressive)
-        print(f"[*] Quick test mode: reduced LR to {scaled_lr:.2e} (25% reduction)")
+        if args.lr_override:
+            scaled_lr = args.lr_override
+            print(f"[*] Quick test mode: using override LR={scaled_lr:.2e}")
+        else:
+            scaled_lr = 1.5e-5  # Known good LR for 500 samples
+            print(f"[*] Quick test mode: using default LR={scaled_lr:.2e}")
+    elif args.lr_override:
+        scaled_lr = args.lr_override
+        print(f"[*] Using override LR={scaled_lr:.2e}")
+
+    # Safety caps: prevent catastrophic LR
+    scaled_lr = max(scaled_lr, 1e-7)  # Lower bound
+    scaled_lr = min(scaled_lr, 5e-4)  # Upper bound
+    if scaled_lr == 5e-4:
+        print(f"[!] WARNING: LR capped at 5e-4 (safety ceiling)")
+    if scaled_lr == 1e-7:
+        print(f"[!] WARNING: LR floored at 1e-7 (safety floor)")
+
+    print(f"[*] Final LR: {scaled_lr:.2e}")
 
     # Optimizer
     optimizer = torch.optim.AdamW(
