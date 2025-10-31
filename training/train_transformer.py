@@ -973,6 +973,10 @@ def main():
     if args.quick_test:
         print(f"[*] Quick test mode: increased patience to {effective_patience} (3x normal)")
 
+    # Collapse detection tracking
+    consecutive_collapses = 0
+    collapse_history = []
+
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
         print("-" * 70)
@@ -997,9 +1001,41 @@ def main():
         print(f"Predictions: Vulnerable={dist['predicted_vulnerable']}/{dist['actual_vulnerable']}, "
               f"Safe={dist['predicted_safe']}/{dist['actual_safe']}")
 
-        # CRITICAL FIX: Detect model collapse
-        if dist['predicted_vulnerable'] == 0 or dist['predicted_safe'] == 0:
-            print(f"[!] CRITICAL: Model collapse detected! Only predicting one class.")
+        # CRITICAL FIX: Hardened collapse detection (require 2 consecutive epochs)
+        val_collapsed = (dist['predicted_vulnerable'] == 0 or dist['predicted_safe'] == 0)
+
+        if val_collapsed and epoch >= 1:  # Start checking from epoch 2
+            consecutive_collapses += 1
+            collapse_history.append(epoch + 1)
+            print(f"[!] COLLAPSE SIGNAL: Zero {'vulnerable' if dist['predicted_vulnerable'] == 0 else 'safe'} predictions")
+        else:
+            consecutive_collapses = 0
+
+        # CSV logging for easy analysis
+        csv_path = args.output_dir / 'metrics_history.csv'
+        if epoch == 0:
+            with open(csv_path, 'w') as f:
+                f.write('epoch,train_loss,val_loss,val_f1,val_acc,val_precision,val_recall,'
+                        'pred_vuln,pred_safe,actual_vuln,actual_safe,lr\n')
+                f.flush()
+
+        with open(csv_path, 'a') as f:
+            current_lr = optimizer.param_groups[0]['lr']
+            f.write(
+                f"{epoch+1},"
+                f"{train_loss:.4f},"
+                f"{val_metrics['loss']:.4f},"
+                f"{val_metrics['binary_f1_vulnerable']:.4f},"
+                f"{val_metrics['accuracy']:.4f},"
+                f"{val_metrics['precision']:.4f},"
+                f"{val_metrics['recall']:.4f},"
+                f"{dist['predicted_vulnerable']},"
+                f"{dist['predicted_safe']},"
+                f"{dist['actual_vulnerable']},"
+                f"{dist['actual_safe']},"
+                f"{current_lr:.2e}\n"
+            )
+            f.flush()  # Critical: flush to survive runtime kills
 
         # CRITICAL FIX: Scheduler now steps inside train_epoch (per-step, not per-epoch)
         # scheduler.step() <- REMOVED
@@ -1018,25 +1054,45 @@ def main():
             patience_counter += 1
             print(f"[*] No improvement. Patience: {patience_counter}/{effective_patience}")
 
-        # CRITICAL FIX: Early stopping with collapse detection
+        # CRITICAL FIX: Stop if 2 consecutive collapses
+        if consecutive_collapses >= 2:
+            print(f"\n{'='*70}")
+            print(f"[!] CRITICAL: Collapse detected for {consecutive_collapses} consecutive epochs")
+            print(f"[!] Collapse history: {collapse_history}")
+            print(f"\n[!] STOPPING TRAINING. Recommended fixes:")
+            print(f"    1. Add: --use-weighted-sampler")
+            print(f"    2. Try: --lr-override 2e-5")
+            print(f"    3. Increase: --weight-multiplier 2.0")
+            print(f"    4. Try: --focal-loss")
+            print(f"{'='*70}\n")
+
+            # Save diagnostic report
+            diagnostic_report = {
+                'collapse_epochs': collapse_history,
+                'final_epoch': epoch + 1,
+                'train_loss': train_loss,
+                'val_metrics': {k: v for k, v in val_metrics.items() if k != 'prediction_distribution'},
+                'prediction_distribution': dist,
+                'hyperparameters': vars(args),
+                'recommendations': [
+                    'use_weighted_sampler=True',
+                    'lr_override=2e-5',
+                    'weight_multiplier=2.0',
+                    'focal_loss=True'
+                ]
+            }
+
+            report_path = args.output_dir / 'collapse_report.json'
+            with open(report_path, 'w') as f:
+                json.dump(diagnostic_report, f, indent=2)
+            print(f"[+] Saved diagnostic report: {report_path}")
+
+            sys.exit(2)  # Exit code 2 = collapse failure
+
+        # CRITICAL FIX: Early stopping with normal patience
         if patience_counter >= effective_patience:
             print(f"\n[!] Early stopping triggered at epoch {epoch + 1}")
             break
-
-        # Additional collapse detection for consecutive epochs
-        if epoch >= 2:  # Check after 3rd epoch
-            # Check for absolute collapse (predicting only one class)
-            if dist['predicted_vulnerable'] == 0 or dist['predicted_safe'] == 0:
-                print(f"\n[!] STOPPING: Complete collapse detected (predicting only one class)")
-                break
-
-            # Check for severe under-prediction (< 20% of actual)
-            actual_vuln = dist['actual_vulnerable']
-            pred_vuln = dist['predicted_vulnerable']
-            if pred_vuln < 0.2 * actual_vuln:
-                print(f"\n[!] WARNING: Severe under-prediction of vulnerable class")
-                print(f"    Predicted: {pred_vuln}, Actual: {actual_vuln} ({100*pred_vuln/actual_vuln:.1f}%)")
-                print(f"    Consider reducing class weights or label smoothing")
 
     print("\n" + "="*70)
     print("TRAINING COMPLETE")
