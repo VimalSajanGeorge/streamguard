@@ -103,7 +103,8 @@ class CodeDataset(Dataset):
         data_path: Path,
         tokenizer,
         max_seq_len: int = 512,
-        use_weights: bool = False
+        use_weights: bool = False,
+        use_features: bool = False
     ):
         """
         Initialize dataset.
@@ -113,10 +114,13 @@ class CodeDataset(Dataset):
             tokenizer: Tokenizer instance
             max_seq_len: Maximum sequence length
             use_weights: Whether to use sample weights
+            use_features: Whether to extract code features
         """
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.use_weights = use_weights
+        self.use_features = use_features
+        self.feature_cache = {}  # Cache extracted features
 
         # Load samples
         self.samples = []
@@ -179,12 +183,43 @@ class CodeDataset(Dataset):
         label = torch.tensor(sample['label'], dtype=torch.long)
         weight = torch.tensor(self.weights[idx], dtype=torch.float)
 
-        return {
+        result = {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
             'label': label,
             'weight': weight
         }
+
+        # Extract code features if enabled
+        if self.use_features:
+            if idx not in self.feature_cache:
+                try:
+                    from core.features.code_metrics import extract_basic_metrics
+                    metrics = extract_basic_metrics(sample['code'])
+
+                    # Normalize features (simple standardization)
+                    features = [
+                        metrics['loc'] / 100.0,
+                        metrics['sloc'] / 100.0,
+                        metrics['sql_concat'] / 5.0,
+                        metrics['execute_calls'] / 5.0,
+                        metrics['user_input'] / 5.0,
+                        metrics['loops'] / 10.0,
+                        metrics['conditionals'] / 10.0,
+                        metrics['function_calls'] / 20.0,
+                        metrics['try_blocks'] / 5.0,
+                        metrics['string_ops'] / 10.0
+                    ]
+                    self.feature_cache[idx] = torch.tensor(
+                        features, dtype=torch.float32
+                    )
+                except Exception as e:
+                    # Fallback: zero vector if extraction fails
+                    self.feature_cache[idx] = torch.zeros(10, dtype=torch.float32)
+
+            result['code_features'] = self.feature_cache[idx]
+
+        return result
 
 
 class EnhancedSQLIntentTransformer(nn.Module):
@@ -195,7 +230,9 @@ class EnhancedSQLIntentTransformer(nn.Module):
         model_name: str = "microsoft/codebert-base",
         hidden_dim: int = 768,
         num_labels: int = 2,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        use_features: bool = False,
+        feature_dim: int = 10
     ):
         """
         Initialize transformer model.
@@ -205,11 +242,23 @@ class EnhancedSQLIntentTransformer(nn.Module):
             hidden_dim: Hidden dimension
             num_labels: Number of output labels
             dropout: Dropout rate
+            use_features: Whether to use code features
+            feature_dim: Dimension of code features
         """
         super().__init__()
 
         self.encoder = AutoModel.from_pretrained(model_name)
         self.dropout = nn.Dropout(dropout)
+        self.use_features = use_features
+
+        # Feature projection and fusion (if using features)
+        if use_features:
+            self.feature_projection = nn.Linear(feature_dim, hidden_dim)
+            self.fusion = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
 
         # Classification head
         self.classifier = nn.Sequential(
@@ -219,13 +268,14 @@ class EnhancedSQLIntentTransformer(nn.Module):
             nn.Linear(hidden_dim // 2, num_labels)
         )
 
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids, attention_mask, code_features=None):
         """
         Forward pass.
 
         Args:
             input_ids: Token IDs [batch, seq_len]
             attention_mask: Attention mask [batch, seq_len]
+            code_features: Code metrics features [batch, feature_dim] (optional)
 
         Returns:
             Logits [batch, num_labels]
@@ -237,11 +287,20 @@ class EnhancedSQLIntentTransformer(nn.Module):
         )
 
         # Use CLS token representation
-        pooled = outputs.last_hidden_state[:, 0]  # [batch, hidden]
-        pooled = self.dropout(pooled)
+        code_emb = outputs.last_hidden_state[:, 0]  # [batch, hidden]
+
+        # Feature fusion (if enabled and features provided)
+        if self.use_features and code_features is not None:
+            feat_emb = self.feature_projection(code_features)  # [batch, hidden]
+            combined = torch.cat([code_emb, feat_emb], dim=1)  # [batch, hidden*2]
+            fused = self.fusion(combined)  # [batch, hidden]
+        else:
+            fused = code_emb
+
+        fused = self.dropout(fused)
 
         # Classification
-        logits = self.classifier(pooled)  # [batch, num_labels]
+        logits = self.classifier(fused)  # [batch, num_labels]
 
         return logits
 
@@ -436,8 +495,12 @@ def evaluate(
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['label'].to(device)
+            # Get code features if available
+            code_features = batch.get('code_features')
+            if code_features is not None:
+                code_features = code_features.to(device)
 
-            logits = model(input_ids, attention_mask)
+            logits = model(input_ids, attention_mask, code_features)
             preds = torch.argmax(logits, dim=1)
 
             all_preds.extend(preds.cpu().numpy())
@@ -515,12 +578,16 @@ def train_epoch(
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         labels = batch['label'].to(device)
+        # Get code features if available
+        code_features = batch.get('code_features')
+        if code_features is not None:
+            code_features = code_features.to(device)
         # Note: weights removed - using class_weights in criterion instead
 
         # Mixed precision training
         if scaler:
             with autocast(device_type='cuda'):
-                logits = model(input_ids, attention_mask)
+                logits = model(input_ids, attention_mask, code_features)
                 loss = criterion(logits, labels)  # Already reduced to scalar with class weights
                 loss = loss / accumulation_steps
 
@@ -542,7 +609,7 @@ def train_epoch(
                 scheduler.step()
 
         else:
-            logits = model(input_ids, attention_mask)
+            logits = model(input_ids, attention_mask, code_features)
             loss = criterion(logits, labels)  # Already reduced to scalar
             loss = loss / accumulation_steps
 
@@ -684,10 +751,10 @@ def main():
 
     # Load datasets
     train_dataset = CodeDataset(
-        args.train_data, tokenizer, args.max_seq_len, args.use_weights
+        args.train_data, tokenizer, args.max_seq_len, args.use_weights, args.use_code_features
     )
     val_dataset = CodeDataset(
-        args.val_data, tokenizer, args.max_seq_len, use_weights=False
+        args.val_data, tokenizer, args.max_seq_len, use_weights=False, use_features=args.use_code_features
     )
 
     # Quick test mode
@@ -780,9 +847,13 @@ def main():
     model = EnhancedSQLIntentTransformer(
         model_name=args.model_name,
         hidden_dim=args.hidden_dim,
-        dropout=dropout_val
+        dropout=dropout_val,
+        use_features=args.use_code_features
     )
     model.to(device)
+
+    if args.use_code_features:
+        print(f"[*] Code features enabled: 10 metrics + fusion layer")
 
     # CRITICAL FIX: Learning rate scaling for large batch sizes
     import math
@@ -1106,7 +1177,7 @@ def main():
         print("="*70)
 
         test_dataset = CodeDataset(
-            args.test_data, tokenizer, args.max_seq_len, use_weights=False
+            args.test_data, tokenizer, args.max_seq_len, use_weights=False, use_features=args.use_code_features
         )
         test_loader = DataLoader(
             test_dataset, batch_size=args.batch_size, shuffle=False
