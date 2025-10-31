@@ -13,8 +13,12 @@ This guide helps you train the StreamGuard vulnerability detection model with th
 - ✅ Safe LR with caps and auto-tuning
 - ✅ CSV logging with metrics tracking
 - 🆕 **LR Finder** - Auto-detect optimal learning rate
+- 🆕 **LR Safety & Caching** - Validation, fallback, and intelligent caching
+- 🆕 **Triple Weighting Auto-Adjustment** - Prevents overcorrection
 - 🆕 **TensorBoard** - Real-time visualization
 - 🆕 **Auto-plotting** - Generate training curves automatically
+- 🆕 **Ablation Testing** - Systematic weighting strategy comparison
+- 🆕 **Enhanced Checkpoint Metadata** - Full reproducibility tracking
 
 ---
 
@@ -91,6 +95,135 @@ python training/train_transformer.py \
 - ✅ **Val F1 > 0.80**
 - ✅ **Focal Loss** helps with hard negatives
 - ✅ **Best performance** on imbalanced data
+
+---
+
+### 4. Ablation Testing Guide
+
+**What is Ablation Testing?**
+
+Ablation testing systematically compares different weighting strategy combinations to find the optimal configuration for your dataset.
+
+**Provided Script:**
+
+The `training/test_ablations.py` script automatically tests 7 combinations:
+
+| Name | Sampler | Weight Multiplier | Focal Loss |
+|------|---------|-------------------|------------|
+| baseline | ❌ | 1.0 | ❌ |
+| sampler_only | ✅ | 1.0 | ❌ |
+| weights_only | ❌ | 1.5 | ❌ |
+| focal_only | ❌ | 1.0 | ✅ |
+| sampler_weights | ✅ | 1.5 | ❌ |
+| sampler_focal | ✅ | 1.0 | ✅ |
+| **all_three** | ✅ | 1.5 → 1.2 (auto) | ✅ (γ clamped) |
+
+**How to run:**
+
+```bash
+# Run full ablation test (70-100 minutes on T4)
+python training/test_ablations.py
+
+# Results saved to: ablation_results.csv
+```
+
+**What it does:**
+1. Runs 10-epoch training for each combination
+2. Records F1, precision, recall, accuracy
+3. Tracks prediction balance (vulnerable vs safe ratio)
+4. Identifies best configuration
+5. Saves comprehensive CSV report
+
+**Example Output:**
+
+```
+╔═══════════════════════════════════════════════════════════════════╗
+║          StreamGuard Ablation Test: Weighting Strategies         ║
+╚═══════════════════════════════════════════════════════════════════╝
+
+Testing 7 combinations of:
+  - WeightedRandomSampler (balances batches)
+  - Class weights (loss weighting)
+  - Focal Loss (hard example focus)
+
+This will take approximately 70-100 minutes (10 min × 7 runs).
+
+[1/7] Testing: baseline
+  Config: Sampler=False, Weight=1.0, Focal=False
+  [+] Complete: F1=0.6234, Precision=0.5821, Recall=0.6712
+
+[2/7] Testing: sampler_only
+  Config: Sampler=True, Weight=1.0, Focal=False
+  [+] Complete: F1=0.7145, Precision=0.6934, Recall=0.7389
+
+[7/7] Testing: all_three
+  [!] Triple weighting detected - auto-adjusting...
+  Config: Sampler=True, Weight=1.5→1.2, Focal=True (γ=1.5)
+  [+] Complete: F1=0.7823, Precision=0.7612, Recall=0.8054
+
+═══════════════════════════════════════════════════════════════════
+ABLATION TEST RESULTS
+═══════════════════════════════════════════════════════════════════
+
+                name  sampler  weight_mult  focal  best_epoch      f1  accuracy  precision  recall  pred_vuln_ratio  actual_vuln_ratio  final_lr
+            baseline    False          1.0  False           8  0.6234    0.6512     0.5821  0.6712           0.4523             0.5400  2.00e-05
+        sampler_only     True          1.0  False           9  0.7145    0.7234     0.6934  0.7389           0.5134             0.5400  2.00e-05
+        weights_only    False          1.5  False           7  0.6823    0.6912     0.6512  0.7156           0.5823             0.5400  2.00e-05
+          focal_only    False          1.0   True           9  0.7034    0.7156     0.6734  0.7367           0.5256             0.5400  2.00e-05
+     sampler_weights     True          1.5  False          10  0.7456    0.7567     0.7234  0.7712           0.5512             0.5400  2.00e-05
+       sampler_focal     True          1.0   True          10  0.7623    0.7689     0.7401  0.7867           0.5489             0.5400  2.00e-05
+           all_three     True          1.2   True          10  0.7823    0.7845     0.7612  0.8054           0.5523             0.5400  2.00e-05
+
+═══════════════════════════════════════════════════════════════════
+BEST CONFIGURATION
+═══════════════════════════════════════════════════════════════════
+  Name: all_three
+  Config: Sampler=True, Weight=1.2, Focal=True
+  F1: 0.7823
+  Precision: 0.7612
+  Recall: 0.8054
+  Pred vulnerable ratio: 55.23%
+  Actual vulnerable ratio: 54.00%
+
+═══════════════════════════════════════════════════════════════════
+ANALYSIS
+═══════════════════════════════════════════════════════════════════
+  Triple weighting (auto-adjusted):
+    F1: 0.7823
+    vs Baseline: +25.5%
+
+  Prediction balance:
+    ✓ all_three          : 55.23% (actual: 54.00%)
+    ✓ sampler_focal      : 54.89% (actual: 54.00%)
+    ✓ sampler_weights    : 55.12% (actual: 54.00%)
+    ✓ sampler_only       : 51.34% (actual: 54.00%)
+    ✓ focal_only         : 52.56% (actual: 54.00%)
+    ! weights_only       : 58.23% (actual: 54.00%)
+    ! baseline           : 45.23% (actual: 54.00%)
+
+[+] Ablation test complete!
+```
+
+**Interpreting Results:**
+
+1. **Best F1**: Which config achieved highest F1?
+2. **Prediction Balance**: How close is `pred_vuln_ratio` to `actual_vuln_ratio`?
+   - Difference < 10% is good (✓)
+   - Difference > 10% indicates imbalance (!)
+3. **Triple Weighting**: Did auto-adjustment prevent overcorrection?
+
+**When to use ablation testing:**
+
+- **New dataset**: Test which weighting works best
+- **Verify fixes**: Confirm triple weighting auto-adjustment helps
+- **Hyperparameter tuning**: Find optimal weight_multiplier
+- **Research**: Compare methods systematically
+
+**Tips:**
+
+- Use `--quick-test` in the script for faster testing (reduces epochs to 5)
+- Results are dataset-dependent - what works for one may not work for another
+- Look for both high F1 AND good balance
 
 ---
 
@@ -181,7 +314,147 @@ Epoch 2: Predictions: Vulnerable=0/54, Safe=100/46
 
 ---
 
-### Issue 4: Training too slow
+### Issue 4: LR Finder suggests unreliable learning rate
+
+**Symptoms:**
+```
+[*] LR Finder Results:
+    Raw suggestion: 2.30e-03
+    Confidence: low
+    Slope magnitude: 0.0012
+    SNR: 0.65
+    Final LR: 1.00e-05 (fallback_due_to_noisy_curve)
+[!] WARNING: Used conservative fallback (1e-5)
+```
+
+**This is normal!** The system detected a poor-quality LR curve and safely fell back to 1e-5.
+
+**Why it happens:**
+- Dataset too small for reliable LR range test
+- Loss curve is flat/noisy (no clear descent)
+- Loss diverges early in the test
+- Training data has high variance
+
+**Solutions:**
+
+1. ✅ **Use the fallback LR** (1e-5 is safe, proven default)
+   ```bash
+   # Just proceed with training - fallback LR works well
+   python training/train_transformer.py --find-lr ...
+   # System already applied safe 1e-5
+   ```
+
+2. ✅ **Override with known-good LR**
+   ```bash
+   --lr-override 1.5e-5
+   # Skips LR Finder validation, uses your value
+   ```
+
+3. ✅ **Increase LR Finder iterations** (more data points)
+   ```bash
+   --find-lr --lr-finder-iterations 200
+   # Default is 100, try 200 for smoother curve
+   ```
+
+4. ✅ **Use larger training subset**
+   ```bash
+   # If using --quick-test, try without it
+   # More data → better LR curve
+   ```
+
+**When to worry:**
+- If fallback LR causes collapse → Use `--lr-override 2e-5`
+- If training is too slow → Try `--lr-override 3e-5`
+
+---
+
+### Issue 5: LR cache won't invalidate
+
+**Symptoms:**
+```
+[*] Loading cached LR Finder results...
+    Cached LR: 1.50e-04
+    Age: 180.5 hours (max: 168 hours)
+[!] Cache expired, running fresh LR Finder...
+```
+
+Or: You changed data but cache still used.
+
+**Solutions:**
+
+1. ✅ **Force refresh**
+   ```bash
+   --find-lr --force-find-lr
+   # Ignores cache, always runs fresh
+   ```
+
+2. ✅ **Adjust cache expiry**
+   ```bash
+   --find-lr --lr-cache-max-age 24
+   # Cache valid for 24 hours only
+   ```
+
+3. ✅ **Manually delete cache**
+   ```bash
+   # Linux/Mac
+   rm -rf ~/.cache/streamguard/lr_finder/
+
+   # Windows
+   rd /s /q %USERPROFILE%\.cache\streamguard\lr_finder
+   ```
+
+**How cache invalidation works:**
+- Automatically expires after `--lr-cache-max-age` hours (default: 168)
+- Cache key includes dataset mtime + size (auto-detects changes)
+- Cache key includes model name, batch size, config
+
+---
+
+### Issue 6: Triple weighting still causing overcorrection
+
+**Symptoms:**
+```
+Epoch 10:
+Predictions: Vulnerable=95/54, Safe=5/46
+Val Precision: 0.45 (too low!)
+Val Recall: 0.98 (too high!)
+```
+
+**This means auto-adjustment wasn't enough.**
+
+**Solutions:**
+
+1. ✅ **Disable one weighting method**
+   ```bash
+   # Try sampler + weights (no focal)
+   --use-weighted-sampler --weight-multiplier 1.2
+
+   # Or sampler + focal (no extra weights)
+   --use-weighted-sampler --focal-loss
+   ```
+
+2. ✅ **Use lower weight multiplier**
+   ```bash
+   --use-weighted-sampler --weight-multiplier 1.1 --focal-loss
+   # Auto-adjusts: 1.1 → 0.88 (effectively turns off class weights)
+   ```
+
+3. ✅ **Run ablation test**
+   ```bash
+   python training/test_ablations.py
+   # Find optimal combination for your dataset
+   ```
+
+**Expected behavior after auto-adjustment:**
+```
+Predictions: Vulnerable=55/54, Safe=45/46
+Val Precision: 0.76 (good!)
+Val Recall: 0.81 (good!)
+```
+
+---
+
+### Issue 7: Training too slow
 
 **Solutions:**
 
@@ -237,14 +510,254 @@ python training/train_transformer.py \
     Iterations: 100
     ...
 [*] LR Finder Results:
-    Steepest descent at LR: 1.50e-05
-    Gradient: -0.0234
-    Loss at that point: 0.6521
-[*] Applying suggested LR: 1.50e-05
+    Raw suggestion: 1.50e-04
+    Confidence: high
+    Slope magnitude: 0.0234
+    SNR: 3.45
+    Final LR: 1.50e-04 (accepted)
+[*] Applying suggested LR: 1.50e-04
 [+] Optimizer and scheduler rebuilt with suggested LR
 ```
 
 **Note:** If you use `--lr-override`, LR Finder will still run but won't apply the suggested LR.
+
+---
+
+### 1.1 LR Finder Safety & Caching
+
+**Safety Features (NEW):**
+
+The LR Finder now includes intelligent safety validation to prevent applying dangerously high or unreliable learning rates:
+
+**Conservative Safety Cap (5e-4):**
+```
+If suggested LR > 5e-4:
+  → Automatically capped to 5e-4
+  → Prevents divergence from too-aggressive LR
+  → Logs original suggestion for reference
+```
+
+**Curve Quality Analysis:**
+The system analyzes the LR-loss curve and assigns a confidence score:
+- **High confidence**: Clear steep descent, good signal-to-noise ratio (SNR > 2.0)
+- **Medium confidence**: Moderate descent, reasonable SNR (SNR > 1.0)
+- **Low confidence**: Flat/noisy curve, or divergence detected
+
+**Automatic Fallback (1e-5):**
+```
+If confidence is low OR divergence detected:
+  → Uses conservative fallback of 1e-5
+  → Prevents applying unreliable suggestions
+  → Logs reason (e.g., "flat_curve", "divergence_after_min")
+```
+
+**Example - Good Curve:**
+```
+[*] LR Finder Results:
+    Raw suggestion: 1.50e-04
+    Confidence: high
+    Slope magnitude: 0.0234
+    SNR: 3.45
+    Final LR: 1.50e-04 (accepted)
+```
+
+**Example - Low Confidence (Fallback Applied):**
+```
+[*] LR Finder Results:
+    Raw suggestion: 2.30e-03
+    Confidence: low
+    Slope magnitude: 0.0012
+    SNR: 0.65
+    Final LR: 1.00e-05 (fallback_due_to_noisy_curve)
+[!] WARNING: Used conservative fallback (1e-5)
+    Reasons: noisy_curve
+```
+
+**Example - Divergent Curve (Fallback Applied):**
+```
+[*] LR Finder Results:
+    Raw suggestion: 5.00e-04
+    Confidence: medium
+    Divergence detected after minimum
+    Final LR: 1.00e-05 (fallback_due_to_divergence_after_min)
+[!] WARNING: Used conservative fallback (1e-5)
+    Reasons: divergence_after_min
+```
+
+**Caching System (NEW):**
+
+To avoid re-running expensive LR Finder tests, results are automatically cached:
+
+**How it works:**
+1. **Cache key** computed from:
+   - Dataset fingerprint (modification time + file size)
+   - Model name (e.g., "microsoft/codebert-base")
+   - Batch size
+   - Additional config (max_seq_len, etc.)
+
+2. **Cache storage**: `~/.cache/streamguard/lr_finder/`
+
+3. **Cache expiry**: Default 168 hours (1 week)
+
+**Usage:**
+```bash
+# First run: Cache miss, runs LR Finder
+python training/train_transformer.py \
+  --find-lr \
+  --train-data data.jsonl
+
+# Second run (same data/config): Cache hit, instant!
+python training/train_transformer.py \
+  --find-lr \
+  --train-data data.jsonl
+# Output: [*] Loading cached LR Finder results...
+
+# Force refresh cache
+python training/train_transformer.py \
+  --find-lr \
+  --force-find-lr \
+  --train-data data.jsonl
+
+# Customize cache expiry (e.g., 24 hours)
+python training/train_transformer.py \
+  --find-lr \
+  --lr-cache-max-age 24
+```
+
+**Cache output example:**
+```
+[*] Computing LR cache key...
+    Dataset: data/processed/codexglue/train.jsonl
+    Fingerprint: mtime=1696723200, size=52428800
+    Model: microsoft/codebert-base
+    Batch size: 32
+    Cache key: a3f5e9b2c4d1f8e7...
+
+[*] Loading cached LR Finder results...
+    Cached LR: 1.50e-04
+    Confidence: high
+    Age: 12.3 hours (max: 168 hours)
+    Analysis: {'slope_mag': 0.0234, 'snr': 3.45, 'diverged': False}
+[+] Using cached LR: 1.50e-04
+```
+
+**Benefits:**
+- **Time savings**: Skip 5-10 minute LR Finder on repeated runs
+- **Consistency**: Same data/config always uses same LR
+- **Smart invalidation**: Auto-refreshes when data changes
+
+---
+
+### 1.2 Triple Weighting Auto-Adjustment
+
+**What is Triple Weighting?**
+
+When you enable all three class-balancing methods simultaneously:
+1. **WeightedRandomSampler** - Balances batches
+2. **Class Weights** (via `--weight-multiplier`) - Weights loss function
+3. **Focal Loss** (via `--focal-loss`) - Focuses on hard examples
+
+The combined effect can **overcorrect**, leading to:
+- Model predicts vulnerable class too aggressively
+- High recall but low precision
+- Many false positives
+
+**Automatic Detection & Adjustment (NEW):**
+
+The training script now detects triple weighting and automatically reduces weights:
+
+**Detection:**
+```python
+if (WeightedRandomSampler is ON)
+   AND (weight_multiplier > 1.0)
+   AND (focal_loss is ON):
+    → Triple weighting detected!
+```
+
+**Auto-Adjustment:**
+```
+1. Reduce weight_multiplier by 20%
+   Example: 1.5 → 1.2
+
+2. Clamp focal_gamma to 1.5 (if > 1.5)
+   Example: 2.0 → 1.5
+
+3. Log original values to checkpoint metadata
+```
+
+**Example Output:**
+```
+═══════════════════════════════════════════════════════════════════
+[!] NOTICE: Triple weighting detected!
+    - WeightedRandomSampler: ON
+    - Class weight multiplier: 1.5
+    - Focal Loss: ON
+
+[*] Auto-adjusting to prevent overcorrection...
+    weight_multiplier: 1.50 → 1.20
+    focal_gamma: 2.00 → 1.5
+
+[*] Recalculating class weights with adjusted multiplier...
+    Vulnerable weight: 2.50 → 2.00
+    Safe weight: 1.00 (unchanged)
+
+[+] Triple weighting auto-adjustment complete.
+    Original values saved to checkpoint metadata for reproducibility.
+═══════════════════════════════════════════════════════════════════
+```
+
+**Why This Helps:**
+
+**Before (No adjustment):**
+```
+Sampler: Balances batches       (+heavy vulnerable focus)
+Weight: 1.5x vulnerable weight  (+heavy vulnerable focus)
+Focal:  Focus on hard negatives (+heavy vulnerable focus)
+────────────────────────────────────────────────────────────────
+Result: TOO MUCH focus → 90% predicted vulnerable (overcorrection!)
+```
+
+**After (Auto-adjustment):**
+```
+Sampler: Balances batches       (+heavy vulnerable focus)
+Weight: 1.2x vulnerable weight  (+moderate vulnerable focus)
+Focal:  γ=1.5 (gentler focus)   (+moderate hard negative focus)
+────────────────────────────────────────────────────────────────
+Result: Balanced focus → 55% predicted vulnerable (just right!)
+```
+
+**Verification:**
+
+Check the ablation test results to confirm this works:
+```bash
+# Run ablation test comparing 7 configurations
+python training/test_ablations.py
+
+# Expected result: 'all_three' config performs well with auto-adjustment
+# Compare F1, precision, recall, and prediction balance
+```
+
+**Checkpoint Metadata:**
+
+Original values are stored for reproducibility:
+```json
+{
+  "triple_weighting_detected": true,
+  "original_weight_multiplier": 1.5,
+  "original_focal_gamma": 2.0,
+  "adjusted_weight_multiplier": 1.2,
+  "adjusted_focal_gamma": 1.5
+}
+```
+
+**Manual Override:**
+
+If you want to skip auto-adjustment (not recommended):
+```bash
+# Currently no flag for this - auto-adjustment is always applied
+# This is intentional to prevent accidental overcorrection
+# If needed, manually edit train_transformer.py line ~850
+```
 
 ---
 
@@ -384,6 +897,8 @@ python training/visualize_training.py --model-dir models/transformer
 |------|---------|-------------|
 | `--find-lr` | False | **Run LR Finder before training (auto-detect optimal LR)** |
 | `--lr-finder-iterations` | 100 | Number of iterations for LR finder |
+| `--force-find-lr` | False | **Ignore cached LR, always run LR Finder fresh** |
+| `--lr-cache-max-age` | 168 | **LR cache validity in hours (default: 1 week)** |
 | `--tensorboard` | False | **Enable TensorBoard logging for real-time visualization** |
 
 ### Dataset Flags

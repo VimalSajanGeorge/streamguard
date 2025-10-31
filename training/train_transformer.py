@@ -345,7 +345,8 @@ class S3CheckpointManager:
         optimizer: torch.optim.Optimizer,
         scheduler: Any,
         metrics: Dict[str, float],
-        is_best: bool = False
+        is_best: bool = False,
+        extra_metadata: Optional[Dict[str, Any]] = None
     ):
         """
         Save checkpoint locally and to S3.
@@ -371,17 +372,23 @@ class S3CheckpointManager:
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-            'metrics': metrics_to_save
+            'metrics': metrics_to_save,
+            # Enhanced metadata from extra_metadata (if provided)
+            **(extra_metadata or {})
         }
 
-        # Save locally
+        # Save locally with atomic write (tmp → rename)
         checkpoint_path = self.local_dir / f'checkpoint_epoch_{epoch}.pt'
-        torch.save(checkpoint, checkpoint_path)
+        tmp_path = checkpoint_path.with_suffix('.pt.tmp')
+        torch.save(checkpoint, tmp_path)
+        tmp_path.replace(checkpoint_path)  # Atomic on most OSes
         print(f"[+] Saved checkpoint: {checkpoint_path}")
 
         if is_best:
             best_path = self.local_dir / 'best_model.pt'
-            torch.save(checkpoint, best_path)
+            tmp_best = best_path.with_suffix('.pt.tmp')
+            torch.save(checkpoint, tmp_best)
+            tmp_best.replace(best_path)  # Atomic
             print(f"[+] Saved best model: {best_path}")
 
             # Upload to S3 if available
@@ -723,6 +730,10 @@ def main():
                         help='Number of iterations for LR finder (default: 100)')
     parser.add_argument('--tensorboard', action='store_true', default=False,
                         help='Enable TensorBoard logging (logs to runs/ directory)')
+    parser.add_argument('--force-find-lr', action='store_true', default=False,
+                        help='Ignore cached LR, always run LR Finder fresh')
+    parser.add_argument('--lr-cache-max-age', type=int, default=168,
+                        help='LR cache validity in hours (default: 168 = 1 week)')
 
     args = parser.parse_args()
 
@@ -804,6 +815,52 @@ def main():
     weight_vulnerable = min(weight_vulnerable, 5.0)
     if weight_vulnerable == 5.0:
         print(f"[!] WARNING: Vulnerable weight capped at 5.0 (safety ceiling)")
+
+    # CRITICAL: Triple-weight detection and auto-adjustment
+    # Detect if all three weighting methods are enabled simultaneously
+    triple_weighting = (
+        getattr(args, "use_weighted_sampler", False) and
+        getattr(args, "weight_multiplier", 1.0) > 1.0 and
+        getattr(args, "focal_loss", False)
+    )
+
+    # Store original values for telemetry
+    original_weight_multiplier = None
+    original_focal_gamma = None
+
+    if triple_weighting:
+        print(f"\n{'='*70}")
+        print(f"[!] NOTICE: Triple weighting detected!")
+        print(f"    - WeightedRandomSampler: ON")
+        print(f"    - Class weight multiplier: {args.weight_multiplier}")
+        print(f"    - Focal Loss: ON")
+        print(f"\n[*] Auto-adjusting to prevent overcorrection...")
+
+        # Store original values
+        original_weight_multiplier = args.weight_multiplier
+        if hasattr(args, 'focal_gamma'):
+            original_focal_gamma = args.focal_gamma
+
+        # Reduce weight multiplier by 20%
+        args.weight_multiplier = max(1.0, float(args.weight_multiplier) * 0.8)
+        print(f"    weight_multiplier: {original_weight_multiplier:.2f} → {args.weight_multiplier:.2f}")
+
+        # Optionally clamp focal_gamma to 1.5
+        if hasattr(args, 'focal_gamma') and args.focal_gamma is not None:
+            if args.focal_gamma > 1.5:
+                print(f"    focal_gamma: {original_focal_gamma:.2f} → 1.5")
+                args.focal_gamma = 1.5
+
+        print(f"{'='*70}\n")
+
+        # Recalculate vulnerable weight with adjusted multiplier
+        if args.quick_test:
+            base_vulnerable_weight = total / (2.0 * num_vulnerable)
+            weight_vulnerable = base_vulnerable_weight * args.weight_multiplier
+            weight_vulnerable = min(weight_vulnerable, 5.0)
+        else:
+            weight_vulnerable = (total / (2.0 * num_vulnerable)) * args.weight_multiplier
+            weight_vulnerable = min(weight_vulnerable, 5.0)
 
     class_weights = torch.tensor(
         [weight_safe, weight_vulnerable],
@@ -1033,33 +1090,101 @@ def main():
         scaler = None
         print(f"[+] Mixed precision training disabled")
 
-    # LR Finder (optional - run before training to auto-detect optimal LR)
+    # LR Finder with caching and validation (optional - run before training to auto-detect optimal LR)
+    lr_finder_analysis = None  # Store for checkpoint metadata
     if args.find_lr:
         print("\n" + "="*70)
         print("RUNNING LR FINDER")
         print("="*70)
 
-        from training.utils.lr_finder import LRFinder
+        from training.utils.lr_finder import LRFinder, analyze_lr_loss_curve, validate_and_cap_lr
+        from training.utils.lr_cache import compute_cache_key, save_lr_cache, load_lr_cache
 
-        # Create a temporary optimizer for LR finding
-        temp_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-7)
-
-        lr_finder = LRFinder(model, temp_optimizer, criterion, device)
-        lr_finder.range_test(
-            train_loader,
-            start_lr=1e-7,
-            end_lr=1.0,
-            num_iter=args.lr_finder_iterations,
-            smooth_f=0.05,
-            diverge_th=5.0
+        # Compute cache key based on dataset + config
+        cache_key = compute_cache_key(
+            dataset_path=args.train_data,
+            model_name=args.model_name,
+            batch_size=args.batch_size,
+            extra={'max_seq_len': args.max_seq_len}
         )
 
-        # Get best LR
-        suggested_lr, lr_loss_history = lr_finder.get_best_lr(skip_start=10, skip_end=5)
+        # Check cache first
+        cached = load_lr_cache(cache_key, max_age_hours=args.lr_cache_max_age)
+        if cached and not args.force_find_lr:
+            print(f"[*] Loading cached LR Finder results...")
+            suggested_lr = cached['suggested_lr']
+            lr_finder_analysis = cached['metadata'].get('analysis', {})
+            print(f"    Cached LR: {suggested_lr:.2e}")
+            print(f"    Confidence: {lr_finder_analysis.get('confidence', 'unknown')}")
+            print(f"    Cached at: {cached['timestamp']}")
+            print(f"    (Use --force-find-lr to re-run)")
+        else:
+            if args.force_find_lr:
+                print(f"[*] --force-find-lr enabled, ignoring cache")
 
-        # Plot results
-        lr_plot_path = args.output_dir / 'lr_finder_plot.png'
-        lr_finder.plot(str(lr_plot_path), skip_start=10, skip_end=5)
+            # Create a temporary optimizer for LR finding
+            temp_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-7)
+
+            lr_finder = LRFinder(model, temp_optimizer, criterion, device)
+            lr_history, loss_history = lr_finder.range_test(
+                train_loader,
+                start_lr=1e-7,
+                end_lr=1.0,
+                num_iter=args.lr_finder_iterations,
+                smooth_f=0.05,
+                diverge_th=5.0
+            )
+
+            # Analyze curve quality
+            lr_finder_analysis = analyze_lr_loss_curve(lr_history, loss_history)
+            candidate_lr = lr_finder_analysis['suggested_lr']
+
+            # Validate and cap with safety checks
+            validation_result = validate_and_cap_lr(
+                candidate_lr,
+                lr_finder_analysis,
+                cap=5e-4,
+                conservative_fallback=1e-5
+            )
+            suggested_lr = validation_result['lr']
+
+            # Log detailed results
+            print(f"\n[*] LR Finder Results:")
+            print(f"    Raw suggestion: {candidate_lr:.2e}")
+            print(f"    Confidence: {lr_finder_analysis['confidence']}")
+            print(f"    Slope magnitude: {lr_finder_analysis['slope_mag']:.4f}")
+            print(f"    SNR: {lr_finder_analysis['snr']:.2f}")
+            if lr_finder_analysis['diverged']:
+                print(f"    [!] Divergence detected after minimum")
+            print(f"    Final LR: {suggested_lr:.2e} ({validation_result['note']})")
+
+            if validation_result['used_fallback']:
+                print(f"[!] WARNING: Used conservative fallback (1e-5) due to poor curve quality")
+                reasons = ', '.join(lr_finder_analysis.get('reason', ['unknown']))
+                print(f"    Reasons: {reasons}")
+
+            # Save to cache
+            save_lr_cache(
+                cache_key,
+                suggested_lr,
+                lr_history_summary={
+                    'min_loss': float(min(loss_history)),
+                    'max_loss': float(max(loss_history)),
+                    'num_points': len(lr_history)
+                },
+                metadata={
+                    'analysis': lr_finder_analysis,
+                    'validation': validation_result,
+                    'timestamp': datetime.now().isoformat(),
+                    'model_name': args.model_name,
+                    'batch_size': args.batch_size
+                }
+            )
+            print(f"[+] LR Finder results cached (key: {cache_key[:12]}...)")
+
+            # Plot results
+            lr_plot_path = args.output_dir / 'lr_finder_plot.png'
+            lr_finder.plot(str(lr_plot_path), skip_start=10, skip_end=5)
 
         # Apply suggested LR if not overridden
         if not args.lr_override:
@@ -1240,10 +1365,24 @@ def main():
         # CRITICAL FIX: Scheduler now steps inside train_epoch (per-step, not per-epoch)
         # scheduler.step() <- REMOVED
 
-        # Save checkpoint
+        # Save checkpoint with enhanced metadata
         is_best = val_metrics['binary_f1_vulnerable'] > best_val_f1
+
+        # Build enhanced metadata
+        enhanced_metadata = {
+            'seed': args.seed,
+            'git_commit': get_git_commit(),
+            'timestamp': datetime.utcnow().isoformat(),
+            'lr_finder_used': bool(args.find_lr),
+            'suggested_lr': float(suggested_lr) if args.find_lr else None,
+            'lr_finder_analysis': lr_finder_analysis if lr_finder_analysis else None,
+            'triple_weighting_detected': triple_weighting if 'triple_weighting' in locals() else False,
+            'original_weight_multiplier': original_weight_multiplier if 'original_weight_multiplier' in locals() else None,
+            'original_focal_gamma': original_focal_gamma if 'original_focal_gamma' in locals() else None
+        }
+
         checkpoint_mgr.save_checkpoint(
-            epoch + 1, model, optimizer, scheduler, val_metrics, is_best
+            epoch + 1, model, optimizer, scheduler, val_metrics, is_best, enhanced_metadata
         )
 
         if is_best:

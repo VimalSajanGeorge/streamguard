@@ -16,8 +16,9 @@ import copy
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Dict, Any
 import math
+import numpy as np
 
 
 class LRFinder:
@@ -294,6 +295,167 @@ class LRFinder:
         plt.savefig(output_path, dpi=150)
         print(f"[+] LR Finder plot saved to: {output_path}")
         plt.close()
+
+
+def analyze_lr_loss_curve(
+    lrs: List[float],
+    losses: List[float],
+    min_slope_threshold: float = 1e-4
+) -> Dict[str, Any]:
+    """
+    Analyze LR-loss curve quality and assign confidence score.
+
+    Uses signal analysis to determine if the curve shows a clear learning rate
+    sweet spot, or if it's too flat/noisy/divergent to trust.
+
+    Args:
+        lrs: List of learning rates tested
+        losses: List of corresponding losses (smoothed)
+        min_slope_threshold: Minimum slope magnitude to consider significant
+
+    Returns:
+        Dictionary with analysis results:
+        {
+            'suggested_lr': float,      # LR at steepest descent
+            'confidence': str,           # 'high' / 'medium' / 'low'
+            'slope_mag': float,          # Magnitude of steepest slope
+            'snr': float,                # Signal-to-noise ratio
+            'diverged': bool,            # Whether loss diverged after minimum
+            'reason': List[str],         # Reasons for low confidence
+            'idx': int                   # Index of suggested LR
+        }
+
+    Example:
+        >>> lrs = [1e-7, 1e-6, 1e-5, 1e-4, 1e-3]
+        >>> losses = [1.0, 0.8, 0.5, 0.4, 2.0]  # Clear descent then divergence
+        >>> analysis = analyze_lr_loss_curve(lrs, losses)
+        >>> print(f"Confidence: {analysis['confidence']}")
+        >>> print(f"Suggested LR: {analysis['suggested_lr']:.2e}")
+    """
+    # Convert to numpy for easier operations
+    lrs = np.asarray(lrs)
+    losses = np.asarray(losses)
+
+    if len(lrs) < 10:
+        # Too few points for reliable analysis
+        return {
+            'suggested_lr': float(lrs[len(lrs) // 2]),
+            'confidence': 'low',
+            'slope_mag': 0.0,
+            'snr': 0.0,
+            'diverged': False,
+            'reason': ['insufficient_data'],
+            'idx': len(lrs) // 2
+        }
+
+    # Smooth losses with simple moving average to reduce noise
+    window = max(1, min(5, len(losses) // 20))
+    if window > 1:
+        kernel = np.ones(window) / window
+        losses_smooth = np.convolve(losses, kernel, mode='same')
+    else:
+        losses_smooth = losses
+
+    # Compute derivative w.r.t log(lr)
+    log_lrs = np.log10(lrs + 1e-30)
+    # Use numpy gradient for central differences
+    deriv = np.gradient(losses_smooth, log_lrs)
+
+    # Find index of steepest negative slope (most negative derivative)
+    idx = int(np.argmin(deriv))
+    suggested_lr = float(lrs[idx])
+
+    # Signal quality metrics
+    slope_mag = float(abs(deriv[idx]))
+    deriv_std = float(np.std(deriv))
+    snr = slope_mag / (deriv_std + 1e-12)
+
+    # Heuristics to assign confidence
+    if slope_mag > 1e-3 and snr > 2.0:
+        confidence = "high"
+    elif slope_mag > 1e-4 and snr > 1.0:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    # Check for catastrophic divergence after minimum
+    min_loss = float(losses_smooth.min())
+    loss_at_end = float(losses_smooth[-1])
+    diverged = (loss_at_end > min_loss * 2.0)  # Loss doubled from minimum
+
+    # Collect reasons for low confidence
+    reason = []
+    if diverged:
+        reason.append("divergence_after_min")
+    if confidence == "low":
+        if slope_mag < min_slope_threshold:
+            reason.append("flat_curve")
+        if snr < 1.0:
+            reason.append("noisy_curve")
+
+    return {
+        "suggested_lr": suggested_lr,
+        "confidence": confidence,
+        "slope_mag": slope_mag,
+        "snr": snr,
+        "diverged": diverged,
+        "reason": reason,
+        "idx": idx
+    }
+
+
+def validate_and_cap_lr(
+    suggested_lr: float,
+    analysis: Dict[str, Any],
+    cap: float = 5e-4,
+    conservative_fallback: float = 1e-5
+) -> Dict[str, Any]:
+    """
+    Validate and cap learning rate with safety checks.
+
+    Applies conservative safety cap and falls back to a safe LR if the
+    curve analysis indicates poor quality (flat, noisy, or divergent).
+
+    Args:
+        suggested_lr: LR suggested by steepest descent heuristic
+        analysis: Output from analyze_lr_loss_curve()
+        cap: Maximum safe LR to apply (default: 5e-4)
+        conservative_fallback: Safe LR to use if validation fails (default: 1e-5)
+
+    Returns:
+        Dictionary with validation results:
+        {
+            'lr': float,              # Final validated LR
+            'used_fallback': bool,    # Whether fallback was applied
+            'note': str               # Description of action taken
+        }
+
+    Example:
+        >>> analysis = {'confidence': 'low', 'diverged': True}
+        >>> result = validate_and_cap_lr(1e-3, analysis)
+        >>> print(f"Final LR: {result['lr']:.2e} ({result['note']})")
+    """
+    final_lr = suggested_lr
+    note = "accepted"
+    used_fallback = False
+
+    # Apply safety cap
+    if suggested_lr > cap:
+        final_lr = cap
+        note = f"capped_to_{cap:.1e}"
+
+    # If analysis indicates poor curve quality -> fallback
+    if analysis.get("confidence") == "low" or analysis.get("diverged", False):
+        final_lr = conservative_fallback
+        used_fallback = True
+        reasons = analysis.get("reason", [])
+        note = f"fallback_due_to_{','.join(reasons)}" if reasons else "fallback_due_to_poor_curve"
+
+    return {
+        "lr": float(final_lr),
+        "used_fallback": used_fallback,
+        "note": note
+    }
 
 
 # Example usage
