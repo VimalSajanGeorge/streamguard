@@ -818,44 +818,140 @@ def main():
 
     print(f"[*] Final LR: {scaled_lr:.2e}")
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=scaled_lr,
-        weight_decay=args.weight_decay,
-        eps=1e-8,
-        betas=(0.9, 0.999)
-    )
+    # Discriminative LR: lower for encoder, higher for head
+    # Use sets to prevent duplicate params
+    encoder_param_ids = set()
+    head_param_ids = set()
+    no_decay_param_ids = set()
 
-    # Adjust warmup ratio proportionally (capped at 20%)
-    if args.batch_size > base_batch:
-        adjusted_warmup_ratio = min(args.warmup_ratio * scale_factor, 0.2)
-    else:
-        adjusted_warmup_ratio = args.warmup_ratio
+    encoder_params = []
+    head_params = []
+    no_decay_params = []
 
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        param_id = id(param)
+
+        # No weight decay for bias and LayerNorm variants
+        # Match: bias, LayerNorm, layer_norm, ln, norm (any case)
+        if any(keyword in name.lower() for keyword in ['bias', 'layernorm', 'layer_norm', 'ln', 'norm']):
+            if param_id not in no_decay_param_ids:
+                no_decay_param_ids.add(param_id)
+                no_decay_params.append(param)
+        # Encoder layers: transformer, encoder, roberta, bert
+        elif any(keyword in name.lower() for keyword in ['transformer', 'encoder', 'roberta', 'bert']):
+            if param_id not in encoder_param_ids:
+                encoder_param_ids.add(param_id)
+                encoder_params.append(param)
+        # Head layers: everything else
+        else:
+            if param_id not in head_param_ids:
+                head_param_ids.add(param_id)
+                head_params.append(param)
+
+    # Verify no duplicates
+    total_unique = len(encoder_param_ids) + len(head_param_ids) + len(no_decay_param_ids)
+    total_params = sum(1 for p in model.parameters() if p.requires_grad)
+    assert total_unique == total_params, \
+        f"Parameter group mismatch: {total_unique} != {total_params}"
+
+    # Discriminative LR
+    encoder_lr = scaled_lr * 0.1  # 10x smaller for pretrained encoder
+    head_lr = scaled_lr * 1.0
+
+    # Build optimizer with parameter groups
+    optimizer = torch.optim.AdamW([
+        {
+            'params': encoder_params,
+            'lr': encoder_lr,
+            'weight_decay': args.weight_decay,
+            'name': 'encoder'  # For debugging
+        },
+        {
+            'params': head_params,
+            'lr': head_lr,
+            'weight_decay': args.weight_decay,
+            'name': 'head'
+        },
+        {
+            'params': no_decay_params,
+            'lr': head_lr,
+            'weight_decay': 0.0,
+            'name': 'no_decay'
+        }
+    ], eps=1e-8, betas=(0.9, 0.999))
+
+    print(f"[*] Discriminative LR:")
+    print(f"    Encoder ({len(encoder_params)} params): LR={encoder_lr:.2e}, WD={args.weight_decay}")
+    print(f"    Head ({len(head_params)} params): LR={head_lr:.2e}, WD={args.weight_decay}")
+    print(f"    No-decay ({len(no_decay_params)} params): LR={head_lr:.2e}, WD=0.0")
+    print(f"    Total trainable params: {total_params}")
+
+    # Scheduler with safe warmup
     # CRITICAL FIX: Account for gradient accumulation in total_steps
     total_steps = math.ceil(len(train_loader) / args.accumulation_steps) * args.epochs
-    warmup_steps = int(total_steps * adjusted_warmup_ratio)
+    warmup_ratio = 0.1  # Default 10%
 
-    print(f"[*] Scheduler config: total_steps={total_steps}, warmup_steps={warmup_steps} ({adjusted_warmup_ratio:.1%})")
+    # Adaptive warmup for large batches
+    if args.batch_size >= 64:
+        warmup_ratio = 0.15
+    elif args.batch_size >= 32:
+        warmup_ratio = 0.12
+
+    warmup_steps = int(warmup_ratio * total_steps)
+
+    # Safety caps
+    warmup_steps = max(warmup_steps, 10)  # Minimum 10 steps
+    warmup_steps = min(warmup_steps, int(0.2 * total_steps))  # Max 20% of training
 
     scheduler = get_linear_schedule_with_warmup(
-        optimizer, warmup_steps, total_steps
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps
     )
 
-    # CRITICAL FIX: Use class-balanced loss with conservative label smoothing
-    # Disable label smoothing for quick test to reduce noise
-    label_smoothing_val = 0.0 if args.quick_test else 0.05
+    print(f"[*] Scheduler config:")
+    print(f"    Total steps: {total_steps}")
+    print(f"    Warmup steps: {warmup_steps} ({warmup_steps/total_steps*100:.1f}%)")
+    print(f"    Warmup ratio: {warmup_ratio}")
 
-    criterion = nn.CrossEntropyLoss(
-        weight=class_weights,                  # Class balancing
-        label_smoothing=label_smoothing_val,   # 0.0 for quick test, 0.05 for full
-        reduction='mean'                       # Simple mean (not 'none')
-    )
-    print(f"[+] Loss: CrossEntropyLoss with class_weights and label_smoothing={label_smoothing_val}")
+    # Loss function with Focal Loss option
+    if args.focal_loss:
+        # Import will be added when we create the file
+        try:
+            from training.losses.focal_loss import FocalLoss
+            criterion = FocalLoss(alpha=class_weights, gamma=args.focal_gamma)
+            print(f"[+] Loss: FocalLoss with gamma={args.focal_gamma}, alpha=class_weights")
+        except ImportError:
+            print(f"[!] WARNING: FocalLoss not found, falling back to CrossEntropyLoss")
+            label_smoothing_val = 0.0 if args.quick_test else 0.05
+            criterion = nn.CrossEntropyLoss(
+                weight=class_weights,
+                label_smoothing=label_smoothing_val,
+                reduction='mean'
+            )
+            print(f"[+] Loss: CrossEntropyLoss (fallback)")
+    else:
+        # Disable label smoothing for quick test to reduce noise
+        label_smoothing_val = 0.0 if args.quick_test else 0.05
+        criterion = nn.CrossEntropyLoss(
+            weight=class_weights,                  # Class balancing
+            label_smoothing=label_smoothing_val,   # 0.0 for quick test, 0.05 for full
+            reduction='mean'                       # Simple mean (not 'none')
+        )
+        print(f"[+] Loss: CrossEntropyLoss with class_weights and label_smoothing={label_smoothing_val}")
 
-    # Mixed precision
-    scaler = GradScaler('cuda') if args.mixed_precision and torch.cuda.is_available() else None
+    # Mixed precision training (with safe defaults)
+    use_amp = args.mixed_precision and torch.cuda.is_available()
+    if use_amp:
+        # Create scaler without device argument (deprecated)
+        scaler = torch.amp.GradScaler()
+        print(f"[+] Mixed precision training enabled (AMP)")
+    else:
+        scaler = None
+        print(f"[+] Mixed precision training disabled")
 
     # Checkpoint manager
     checkpoint_mgr = S3CheckpointManager(
