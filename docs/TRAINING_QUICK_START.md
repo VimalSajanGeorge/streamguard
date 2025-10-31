@@ -12,6 +12,9 @@ This guide helps you train the StreamGuard vulnerability detection model with th
 - ✅ Focal Loss for hard negatives
 - ✅ Safe LR with caps and auto-tuning
 - ✅ CSV logging with metrics tracking
+- 🆕 **LR Finder** - Auto-detect optimal learning rate
+- 🆕 **TensorBoard** - Real-time visualization
+- 🆕 **Auto-plotting** - Generate training curves automatically
 
 ---
 
@@ -199,6 +202,158 @@ Epoch 2: Predictions: Vulnerable=0/54, Safe=100/46
 
 ---
 
+## New Features Guide (Priority 1 - Quick Wins)
+
+### 1. LR Finder (Auto-detect Optimal Learning Rate)
+
+**What it does:** Automatically finds the optimal learning rate before training using Leslie Smith's method.
+
+**How to use:**
+```bash
+python training/train_transformer.py \
+  --train-data data/processed/codexglue/train.jsonl \
+  --val-data data/processed/codexglue/valid.jsonl \
+  --find-lr \
+  --lr-finder-iterations 100
+```
+
+**What happens:**
+1. Runs LR range test (start: 1e-7, end: 1.0)
+2. Tests ~100 different learning rates
+3. Finds LR with steepest descent (fastest loss decrease)
+4. Automatically applies suggested LR to training
+5. Saves plot to `models/transformer/lr_finder_plot.png`
+
+**Benefits:**
+- Eliminates manual LR tuning
+- Prevents too-high LR (divergence) or too-low LR (slow learning)
+- Takes 5-10 minutes, saves hours of experimentation
+
+**Example output:**
+```
+[*] Running LR Finder...
+    Start LR: 1.00e-07
+    End LR: 1.00e+00
+    Iterations: 100
+    ...
+[*] LR Finder Results:
+    Steepest descent at LR: 1.50e-05
+    Gradient: -0.0234
+    Loss at that point: 0.6521
+[*] Applying suggested LR: 1.50e-05
+[+] Optimizer and scheduler rebuilt with suggested LR
+```
+
+**Note:** If you use `--lr-override`, LR Finder will still run but won't apply the suggested LR.
+
+---
+
+### 2. TensorBoard (Real-time Visualization)
+
+**What it does:** Logs training metrics in real-time for interactive visualization.
+
+**How to use:**
+```bash
+# Start training with TensorBoard
+python training/train_transformer.py \
+  --train-data data/processed/codexglue/train.jsonl \
+  --val-data data/processed/codexglue/valid.jsonl \
+  --tensorboard \
+  --epochs 10
+
+# In another terminal, start TensorBoard
+tensorboard --logdir=models/transformer/runs
+```
+
+**What you'll see:**
+- Loss curves (train vs val) in real-time
+- F1, accuracy, precision, recall progression
+- Prediction distribution (vulnerable vs safe counts)
+- Learning rate schedule
+- All metrics grouped and filterable
+
+**Benefits:**
+- Real-time monitoring (no waiting for training to finish)
+- Compare multiple runs side-by-side
+- Interactive zooming and filtering
+- Share results via TensorBoard.dev (optional)
+
+**TensorBoard URL:** Open browser to `http://localhost:6006`
+
+---
+
+### 3. Auto-plotting (Generate Training Curves)
+
+**What it does:** Automatically generates comprehensive training visualizations from CSV logs.
+
+**How to use:**
+```bash
+# After training completes
+python training/visualize_training.py --model-dir models/transformer
+
+# Or specify CSV directly
+python training/visualize_training.py --metrics-csv models/transformer/metrics_history.csv
+```
+
+**What plots are generated:**
+1. **loss_curves.png** - Train vs val loss over epochs
+2. **f1_progression.png** - F1 score with best epoch marked
+3. **metrics_overview.png** - Accuracy, precision, recall, F1 together
+4. **prediction_distribution.png** - Vulnerable vs safe predictions (counts + percentages)
+5. **lr_schedule.png** - Learning rate over epochs (log scale)
+6. **training_dashboard.png** - Comprehensive dashboard with all metrics + summary stats
+
+**Benefits:**
+- Publication-ready plots with one command
+- Automatic detection of best epoch
+- Summary statistics included
+- No manual matplotlib coding needed
+
+**Example output:**
+```
+[+] Loaded 10 epochs from models/transformer/metrics_history.csv
+[*] Generating plots...
+[+] Saved: models/transformer/plots/loss_curves.png
+[+] Saved: models/transformer/plots/f1_progression.png
+[+] Saved: models/transformer/plots/metrics_overview.png
+[+] Saved: models/transformer/plots/prediction_distribution.png
+[+] Saved: models/transformer/plots/lr_schedule.png
+[+] Saved comprehensive dashboard: models/transformer/plots/training_dashboard.png
+[+] All plots generated successfully!
+```
+
+---
+
+### Full Example Workflow (with all new features)
+
+```bash
+# 1. Find optimal LR + train with TensorBoard
+python training/train_transformer.py \
+  --train-data data/processed/codexglue/train.jsonl \
+  --val-data data/processed/codexglue/valid.jsonl \
+  --test-data data/processed/codexglue/test.jsonl \
+  --find-lr \
+  --tensorboard \
+  --epochs 10 \
+  --batch-size 32 \
+  --use-weighted-sampler \
+  --use-code-features \
+  --seed 42
+
+# 2. (In another terminal) Start TensorBoard
+tensorboard --logdir=models/transformer/runs
+
+# 3. After training, generate plots
+python training/visualize_training.py --model-dir models/transformer
+
+# 4. View results
+# - TensorBoard: http://localhost:6006
+# - Plots: models/transformer/plots/
+# - CSV: models/transformer/metrics_history.csv
+```
+
+---
+
 ## Configuration Flags Reference
 
 ### Critical Flags (Use These!)
@@ -223,6 +378,14 @@ Epoch 2: Predictions: Vulnerable=0/54, Safe=100/46
 | `--mixed-precision` | False | Enable AMP |
 | `--quick-test` | False | Use 500 train, 100 val samples |
 
+### NEW: Priority 1 Flags (Quick Wins)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--find-lr` | False | **Run LR Finder before training (auto-detect optimal LR)** |
+| `--lr-finder-iterations` | 100 | Number of iterations for LR finder |
+| `--tensorboard` | False | **Enable TensorBoard logging for real-time visualization** |
+
 ### Dataset Flags
 
 | Flag | Required | Description |
@@ -245,6 +408,9 @@ After training, check these files:
 - `models/transformer/metrics_history.csv` - All metrics per epoch
 - `models/transformer/exp_config.json` - Full experiment config
 - `models/transformer/collapse_report.json` - Diagnostic report (if collapse occurred)
+- `models/transformer/lr_finder_plot.png` - LR Finder results (if --find-lr used)
+- `models/transformer/runs/` - TensorBoard logs (if --tensorboard used)
+- `models/transformer/plots/` - Auto-generated visualizations (from visualize_training.py)
 
 ### CSV Columns
 ```

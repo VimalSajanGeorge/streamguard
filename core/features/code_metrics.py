@@ -41,6 +41,14 @@ def extract_basic_metrics(code: str) -> Dict[str, int]:
         >>> metrics['execute_calls']  # Should be 0
         0
     """
+    # Handle empty code edge case
+    if not code or not code.strip():
+        return {
+            'loc': 0, 'sloc': 0, 'sql_concat': 0, 'execute_calls': 0,
+            'user_input': 0, 'loops': 0, 'conditionals': 0,
+            'function_calls': 0, 'try_blocks': 0, 'string_ops': 0
+        }
+
     lines = code.split('\n')
 
     # Basic counts
@@ -72,8 +80,8 @@ def extract_basic_metrics(code: str) -> Dict[str, int]:
             if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Add, ast.Mult))
         ])
 
-    except SyntaxError:
-        # Fallback: code not parseable (non-Python or syntax errors)
+    except (SyntaxError, ValueError, TypeError, Exception):
+        # Fallback: code not parseable (non-Python, syntax errors, or invalid input)
         loops = conditionals = function_calls = try_blocks = string_ops = 0
 
     # Return dictionary with capped values (prevent outliers)

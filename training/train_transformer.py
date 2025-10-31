@@ -17,6 +17,7 @@ import argparse
 import random
 import hashlib
 import subprocess
+import math
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
@@ -215,6 +216,8 @@ class CodeDataset(Dataset):
                     )
                 except Exception as e:
                     # Fallback: zero vector if extraction fails
+                    import warnings
+                    warnings.warn(f"Feature extraction failed for sample {idx}: {str(e)}")
                     self.feature_cache[idx] = torch.zeros(10, dtype=torch.float32)
 
             result['code_features'] = self.feature_cache[idx]
@@ -714,6 +717,12 @@ def main():
                         help='Use Focal Loss instead of CrossEntropy (helps with hard negatives)')
     parser.add_argument('--focal-gamma', type=float, default=2.0,
                         help='Focal loss gamma (1.0-2.5, higher=more focus on hard examples)')
+    parser.add_argument('--find-lr', action='store_true', default=False,
+                        help='Run LR Finder before training (auto-detect optimal LR)')
+    parser.add_argument('--lr-finder-iterations', type=int, default=100,
+                        help='Number of iterations for LR finder (default: 100)')
+    parser.add_argument('--tensorboard', action='store_true', default=False,
+                        help='Enable TensorBoard logging (logs to runs/ directory)')
 
     args = parser.parse_args()
 
@@ -1024,12 +1033,102 @@ def main():
         scaler = None
         print(f"[+] Mixed precision training disabled")
 
+    # LR Finder (optional - run before training to auto-detect optimal LR)
+    if args.find_lr:
+        print("\n" + "="*70)
+        print("RUNNING LR FINDER")
+        print("="*70)
+
+        from training.utils.lr_finder import LRFinder
+
+        # Create a temporary optimizer for LR finding
+        temp_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-7)
+
+        lr_finder = LRFinder(model, temp_optimizer, criterion, device)
+        lr_finder.range_test(
+            train_loader,
+            start_lr=1e-7,
+            end_lr=1.0,
+            num_iter=args.lr_finder_iterations,
+            smooth_f=0.05,
+            diverge_th=5.0
+        )
+
+        # Get best LR
+        suggested_lr, lr_loss_history = lr_finder.get_best_lr(skip_start=10, skip_end=5)
+
+        # Plot results
+        lr_plot_path = args.output_dir / 'lr_finder_plot.png'
+        lr_finder.plot(str(lr_plot_path), skip_start=10, skip_end=5)
+
+        # Apply suggested LR if not overridden
+        if not args.lr_override:
+            print(f"[*] Applying suggested LR: {suggested_lr:.2e}")
+            scaled_lr = suggested_lr
+            # Rebuild optimizer with new LR
+            optimizer = torch.optim.AdamW([
+                {
+                    'params': encoder_params,
+                    'lr': scaled_lr * 0.1,
+                    'weight_decay': args.weight_decay,
+                    'name': 'encoder'
+                },
+                {
+                    'params': head_params,
+                    'lr': scaled_lr * 1.0,
+                    'weight_decay': args.weight_decay,
+                    'name': 'head'
+                },
+                {
+                    'params': no_decay_params,
+                    'lr': scaled_lr * 1.0,
+                    'weight_decay': 0.0,
+                    'name': 'no_decay'
+                }
+            ], eps=1e-8, betas=(0.9, 0.999))
+
+            # Rebuild scheduler with new optimizer
+            total_steps = math.ceil(len(train_loader) / args.accumulation_steps) * args.epochs
+            warmup_ratio = 0.1
+            if args.batch_size >= 64:
+                warmup_ratio = 0.15
+            elif args.batch_size >= 32:
+                warmup_ratio = 0.12
+            warmup_steps = int(warmup_ratio * total_steps)
+            warmup_steps = max(warmup_steps, 10)
+            warmup_steps = min(warmup_steps, int(0.2 * total_steps))
+
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_steps
+            )
+
+            print(f"[+] Optimizer and scheduler rebuilt with suggested LR")
+        else:
+            print(f"[*] Using --lr-override={args.lr_override:.2e}, ignoring LR Finder suggestion")
+
+        print("="*70 + "\n")
+
     # Checkpoint manager
     checkpoint_mgr = S3CheckpointManager(
         args.output_dir / 'checkpoints',
         args.s3_bucket,
         args.s3_prefix
     )
+
+    # TensorBoard writer (optional)
+    writer = None
+    if args.tensorboard:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            tensorboard_dir = args.output_dir / 'runs' / datetime.now().strftime('%Y%m%d_%H%M%S')
+            writer = SummaryWriter(log_dir=str(tensorboard_dir))
+            print(f"[+] TensorBoard logging enabled: {tensorboard_dir}")
+            print(f"    View with: tensorboard --logdir={tensorboard_dir.parent}")
+        except ImportError:
+            print("[!] WARNING: tensorboard not available, skipping TensorBoard logging")
+            writer = None
 
     # Training loop
     print("\n" + "="*70)
@@ -1072,6 +1171,34 @@ def main():
         print(f"Predictions: Vulnerable={dist['predicted_vulnerable']}/{dist['actual_vulnerable']}, "
               f"Safe={dist['predicted_safe']}/{dist['actual_safe']}")
 
+        # TensorBoard logging
+        if writer:
+            # Loss curves
+            writer.add_scalar('Loss/train', train_loss, epoch)
+            writer.add_scalar('Loss/val', val_metrics['loss'], epoch)
+
+            # Metrics
+            writer.add_scalar('Metrics/accuracy', val_metrics['accuracy'], epoch)
+            writer.add_scalar('Metrics/precision', val_metrics['precision'], epoch)
+            writer.add_scalar('Metrics/recall', val_metrics['recall'], epoch)
+            writer.add_scalar('Metrics/f1_vulnerable', val_metrics['binary_f1_vulnerable'], epoch)
+
+            # Prediction distribution
+            writer.add_scalar('Predictions/vulnerable_count', dist['predicted_vulnerable'], epoch)
+            writer.add_scalar('Predictions/safe_count', dist['predicted_safe'], epoch)
+            writer.add_scalar('Predictions/vulnerable_ratio',
+                            dist['predicted_vulnerable'] / (dist['predicted_vulnerable'] + dist['predicted_safe'] + 1e-8),
+                            epoch)
+
+            # Learning rate
+            current_lr = optimizer.param_groups[0]['lr']
+            writer.add_scalar('Learning_Rate/encoder', optimizer.param_groups[0]['lr'], epoch)
+            if len(optimizer.param_groups) > 1:
+                writer.add_scalar('Learning_Rate/head', optimizer.param_groups[1]['lr'], epoch)
+
+            # Flush to ensure data is written
+            writer.flush()
+
         # CRITICAL FIX: Hardened collapse detection (require 2 consecutive epochs)
         val_collapsed = (dist['predicted_vulnerable'] == 0 or dist['predicted_safe'] == 0)
 
@@ -1084,6 +1211,8 @@ def main():
 
         # CSV logging for easy analysis
         csv_path = args.output_dir / 'metrics_history.csv'
+        # Ensure directory exists
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
         if epoch == 0:
             with open(csv_path, 'w') as f:
                 f.write('epoch,train_loss,val_loss,val_f1,val_acc,val_precision,val_recall,'
@@ -1197,6 +1326,11 @@ def main():
         print(f"Test F1 (vulnerable): {test_metrics['binary_f1_vulnerable']:.4f}")
 
     print(f"\n[+] Model saved to: {args.output_dir}")
+
+    # Close TensorBoard writer
+    if writer:
+        writer.close()
+        print(f"[+] TensorBoard logs saved")
 
     return 0
 
