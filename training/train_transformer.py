@@ -1172,7 +1172,7 @@ def main():
             save_lr_cache(
                 cache_key,
                 suggested_lr,
-                lr_history_summary={
+                lr_history={
                     'min_loss': float(min(loss_history)),
                     'max_loss': float(max(loss_history)),
                     'num_points': len(lr_history)
