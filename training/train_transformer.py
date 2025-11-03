@@ -1097,8 +1097,13 @@ def main():
         print("RUNNING LR FINDER")
         print("="*70)
 
-        from training.utils.lr_finder import LRFinder, analyze_lr_loss_curve, validate_and_cap_lr
-        from training.utils.lr_cache import compute_cache_key, save_lr_cache, load_lr_cache
+        # Handle both absolute and relative imports for notebook compatibility
+        try:
+            from training.utils.lr_finder import LRFinder, analyze_lr_loss_curve, validate_and_cap_lr
+            from training.utils.lr_cache import compute_cache_key, save_lr_cache, load_lr_cache
+        except ModuleNotFoundError:
+            from utils.lr_finder import LRFinder, analyze_lr_loss_curve, validate_and_cap_lr
+            from utils.lr_cache import compute_cache_key, save_lr_cache, load_lr_cache
 
         # Compute cache key based on dataset + config
         cache_key = compute_cache_key(
