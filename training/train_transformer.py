@@ -1417,7 +1417,7 @@ def main():
                 'train_loss': train_loss,
                 'val_metrics': {k: v for k, v in val_metrics.items() if k != 'prediction_distribution'},
                 'prediction_distribution': dist,
-                'hyperparameters': vars(args),
+                'hyperparameters': {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                 'recommendations': [
                     'use_weighted_sampler=True',
                     'lr_override=2e-5',
