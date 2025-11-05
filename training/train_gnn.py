@@ -348,9 +348,10 @@ class S3CheckpointManager:
         optimizer: torch.optim.Optimizer,
         scheduler: Any,
         metrics: Dict[str, float],
-        is_best: bool = False
+        is_best: bool = False,
+        extra_metadata: Optional[Dict[str, Any]] = None
     ):
-        """Save checkpoint locally and to S3."""
+        """Save checkpoint locally and to S3 (with enhanced metadata and atomic writes)."""
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
@@ -359,14 +360,28 @@ class S3CheckpointManager:
             'metrics': metrics
         }
 
-        # Save locally
+        # PHASE 1: Add enhanced metadata
+        if extra_metadata:
+            checkpoint.update(extra_metadata)
+
+        # PHASE 1: Atomic writes (tmp file → rename)
         checkpoint_path = self.local_dir / f'checkpoint_epoch_{epoch}.pt'
-        torch.save(checkpoint, checkpoint_path)
+        tmp_checkpoint_path = checkpoint_path.with_suffix('.pt.tmp')
+        torch.save(checkpoint, tmp_checkpoint_path)
+        tmp_checkpoint_path.replace(checkpoint_path)
 
         if is_best:
             best_path = self.local_dir / 'best_model.pt'
-            torch.save(checkpoint, best_path)
+            tmp_best_path = best_path.with_suffix('.pt.tmp')
+            torch.save(checkpoint, tmp_best_path)
+            tmp_best_path.replace(best_path)
             print(f"[+] Saved best model: {best_path}")
+
+            # PHASE 1: Save metadata.json alongside checkpoint
+            metadata_path = self.local_dir / 'best_model_metadata.json'
+            if extra_metadata:
+                with open(metadata_path, 'w') as f:
+                    json.dump(extra_metadata, f, indent=2, default=str)
 
             if self.s3_client:
                 s3_key = f"{self.s3_prefix}/best_model.pt" if self.s3_prefix else "best_model.pt"
@@ -377,7 +392,9 @@ class S3CheckpointManager:
 
         # Latest for Spot resilience
         latest_path = self.local_dir / 'latest.pt'
-        torch.save(checkpoint, latest_path)
+        tmp_latest_path = latest_path.with_suffix('.pt.tmp')
+        torch.save(checkpoint, tmp_latest_path)
+        tmp_latest_path.replace(latest_path)
 
         if self.s3_client:
             s3_key = f"{self.s3_prefix}/latest.pt" if self.s3_prefix else "latest.pt"
@@ -1038,10 +1055,31 @@ def main():
         # Step scheduler
         scheduler.step(val_metrics['binary_f1_vulnerable'])
 
+        # PHASE 1: Prepare enhanced metadata for checkpoint
+        enhanced_metadata = {
+            'seed': args.seed,
+            'git_commit': get_git_commit(),
+            'timestamp': datetime.now().isoformat(),
+            'lr_finder_used': bool(args.find_lr and LR_FINDER_AVAILABLE),
+            'suggested_lr': float(optimizer.param_groups[0]['lr']),
+            'triple_weighting': triple_weighting,
+            'weighted_sampler': args.use_weighted_sampler,
+            'focal_loss': args.focal_loss,
+            'weight_multiplier': args.weight_multiplier,
+            'class_weights': class_weights.cpu().tolist(),
+            'prediction_distribution': dist,
+            'collapse_history': collapse_history,
+            'consecutive_collapses': consecutive_collapses
+        }
+
+        if lr_finder_analysis:
+            enhanced_metadata['lr_finder_analysis'] = lr_finder_analysis
+
         # Save checkpoint
         is_best = val_metrics['binary_f1_vulnerable'] > best_val_f1
         checkpoint_mgr.save_checkpoint(
-            epoch + 1, model, optimizer, scheduler, val_metrics, is_best
+            epoch + 1, model, optimizer, scheduler, val_metrics, is_best,
+            extra_metadata=enhanced_metadata
         )
 
         if is_best:
