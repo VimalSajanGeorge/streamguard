@@ -242,4 +242,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        print("\n[+] Training completed successfully!")
+        sys.exit(0)  # Success
+    except Exception as e:
+        print(f"\n[!] Training failed with error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)  # Failure

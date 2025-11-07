@@ -213,7 +213,7 @@ def compute_graph_statistics(dataset):
 # ==================== LR FINDER FOR GRAPHS ====================
 
 def run_lr_finder_pyg(model, train_loader, device, cache_key):
-    """Run LR Finder for PyG graphs with caching."""
+    """Run LR Finder for PyG graphs with caching and fallback."""
     print("\n[*] Checking LR Finder cache...")
 
     # Check cache
@@ -224,73 +224,84 @@ def run_lr_finder_pyg(model, train_loader, device, cache_key):
 
     print("[*] Running LR Finder for GNN (quick mode)...")
 
-    # Optimizer and criterion
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-7)
-    criterion = FocalLoss(gamma=BASE_CONFIG['focal_loss_gamma'])
+    # FALLBACK: Conservative default if LR Finder fails
+    FALLBACK_LR = 5e-4  # Safe middle-ground for GNNs
 
-    # LR Finder
-    lr_history = []
-    loss_history = []
+    try:
+        # Optimizer and criterion
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-7)
+        criterion = FocalLoss(gamma=BASE_CONFIG['focal_loss_gamma'])
 
-    model.train()
-    lr = 1e-7
-    end_lr = 1e-2
-    num_iter = 100
-    lr_mult = (end_lr / lr) ** (1 / num_iter)
+        # LR Finder
+        lr_history = []
+        loss_history = []
 
-    train_iter = iter(train_loader)
+        model.train()
+        lr = 1e-7
+        end_lr = 1e-2
+        num_iter = 100
+        lr_mult = (end_lr / lr) ** (1 / num_iter)
 
-    for iteration in range(num_iter):
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            batch = next(train_iter)
+        train_iter = iter(train_loader)
 
-        # Update LR
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+        for iteration in range(num_iter):
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                batch = next(train_iter)
 
-        # Forward pass
-        batch = batch.to(device)
-        optimizer.zero_grad()
-        logits = model(batch)
-        loss = criterion(logits, batch.y)
+            # Update LR
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
 
-        # Backward
-        loss.backward()
-        optimizer.step()
+            # Forward pass
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            logits = model(batch)
+            loss = criterion(logits, batch.y)
 
-        # Track
-        lr_history.append(lr)
-        loss_history.append(loss.item())
+            # Backward
+            loss.backward()
+            optimizer.step()
 
-        # Increase LR
-        lr *= lr_mult
+            # Track
+            lr_history.append(lr)
+            loss_history.append(loss.item())
 
-    # Find best LR (steepest descent)
-    gradients = np.gradient(loss_history)
-    best_idx = np.argmin(gradients)
-    suggested_lr = lr_history[best_idx]
+            # Increase LR
+            lr *= lr_mult
 
-    # Cap to safe range (1e-4 to 1e-3 for GNNs)
-    suggested_lr = max(1e-4, min(suggested_lr, 1e-3))
+        # Find best LR (steepest descent)
+        gradients = np.gradient(loss_history)
+        best_idx = np.argmin(gradients)
+        suggested_lr = lr_history[best_idx]
 
-    print(f"[+] Suggested LR: {suggested_lr:.2e}")
+        # Cap to safe range (1e-4 to 1e-3 for GNNs)
+        suggested_lr = max(1e-4, min(suggested_lr, 1e-3))
 
-    # Cache
-    save_lr_cache(
-        cache_key,
-        suggested_lr,
-        {
-            "min_loss": float(min(loss_history)),
-            "max_loss": float(max(loss_history)),
-            "num_points": len(lr_history)
-        },
-        {"confidence": "high", "mode": "quick_pyg"}
-    )
+        print(f"[+] Suggested LR: {suggested_lr:.2e}")
 
-    return suggested_lr
+        # Cache
+        save_lr_cache(
+            cache_key,
+            suggested_lr,
+            {
+                "min_loss": float(min(loss_history)),
+                "max_loss": float(max(loss_history)),
+                "num_points": len(lr_history)
+            },
+            {"confidence": "high", "mode": "quick_pyg"}
+        )
+
+        return suggested_lr
+
+    except Exception as e:
+        warnings.warn(
+            f"\n[!] LR Finder failed: {str(e)}\n"
+            f"[!] Using conservative fallback LR: {FALLBACK_LR:.2e}\n"
+        )
+        return FALLBACK_LR
 
 
 # ==================== TRAINING FUNCTIONS ====================
@@ -601,4 +612,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        print("\n[+] Training completed successfully!")
+        sys.exit(0)  # Success
+    except Exception as e:
+        print(f"\n[!] Training failed with error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)  # Failure

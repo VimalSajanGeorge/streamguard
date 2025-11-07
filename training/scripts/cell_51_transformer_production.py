@@ -125,7 +125,7 @@ def create_weighted_sampler(dataset):
 
 
 def run_lr_finder(model, train_loader, device, cache_key):
-    """Run LR Finder with caching."""
+    """Run LR Finder with caching and fallback."""
     print("\n[*] Checking LR Finder cache...")
 
     # Check cache first
@@ -137,41 +137,52 @@ def run_lr_finder(model, train_loader, device, cache_key):
 
     print("[*] Running LR Finder (quick mode: 100 iterations)...")
 
-    # Create optimizer and criterion
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-7)
-    criterion = nn.CrossEntropyLoss(weight=CLASS_WEIGHTS.to(device))
+    # FALLBACK: Conservative default if LR Finder fails
+    FALLBACK_LR = 2.5e-5  # Safe middle-ground for transformers
 
-    # Run LR Finder
-    lr_finder = LRFinder(model, optimizer, criterion, device)
-    lr_history, loss_history = lr_finder.range_test(
-        train_loader,
-        start_lr=1e-7,
-        end_lr=1.0,
-        num_iter=100,  # Quick mode
-        smooth_f=0.05
-    )
+    try:
+        # Create optimizer and criterion
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-7)
+        criterion = nn.CrossEntropyLoss(weight=CLASS_WEIGHTS.to(device))
 
-    # Get best LR
-    suggested_lr, _ = lr_finder.get_best_lr()
+        # Run LR Finder
+        lr_finder = LRFinder(model, optimizer, criterion, device)
+        lr_history, loss_history = lr_finder.range_test(
+            train_loader,
+            start_lr=1e-7,
+            end_lr=1.0,
+            num_iter=100,  # Quick mode
+            smooth_f=0.05
+        )
 
-    # Cap LR to safe range (1e-5 to 5e-5 for transformers)
-    suggested_lr = max(1e-5, min(suggested_lr, 5e-5))
+        # Get best LR
+        suggested_lr, _ = lr_finder.get_best_lr()
 
-    print(f"[+] Suggested LR: {suggested_lr:.2e}")
+        # Cap LR to safe range (1e-5 to 5e-5 for transformers)
+        suggested_lr = max(1e-5, min(suggested_lr, 5e-5))
 
-    # Cache results
-    save_lr_cache(
-        cache_key,
-        suggested_lr,
-        {
-            "min_loss": float(min(loss_history)),
-            "max_loss": float(max(loss_history)),
-            "num_points": len(lr_history)
-        },
-        {"confidence": "high", "mode": "quick"}
-    )
+        print(f"[+] Suggested LR: {suggested_lr:.2e}")
 
-    return suggested_lr
+        # Cache results
+        save_lr_cache(
+            cache_key,
+            suggested_lr,
+            {
+                "min_loss": float(min(loss_history)),
+                "max_loss": float(max(loss_history)),
+                "num_points": len(lr_history)
+            },
+            {"confidence": "high", "mode": "quick"}
+        )
+
+        return suggested_lr
+
+    except Exception as e:
+        warnings.warn(
+            f"\n[!] LR Finder failed: {str(e)}\n"
+            f"[!] Using conservative fallback LR: {FALLBACK_LR:.2e}\n"
+        )
+        return FALLBACK_LR
 
 
 def train_one_epoch(
@@ -500,4 +511,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        print("\n[+] Training completed successfully!")
+        sys.exit(0)  # Success
+    except Exception as e:
+        print(f"\n[!] Training failed with error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)  # Failure

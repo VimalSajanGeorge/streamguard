@@ -580,7 +580,7 @@ def main():
                 batch['attention_mask'].to(device)
             )
             val_trans_logits.append(logits.cpu().numpy())
-            val_labels.extend(batch['label'].numpy())
+            val_labels.extend(batch['label'].detach().cpu().numpy())
 
     val_trans_logits = np.vstack(val_trans_logits)
     val_labels = np.array(val_labels)
