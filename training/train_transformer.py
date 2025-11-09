@@ -735,7 +735,17 @@ def main():
     parser.add_argument('--lr-cache-max-age', type=int, default=168,
                         help='LR cache validity in hours (default: 168 = 1 week)')
 
+    # Production mode (multi-seed training)
+    parser.add_argument('--production-mode', action='store_true', default=False,
+                        help='Run multi-seed production training (runs 3 seeds and aggregates results)')
+    parser.add_argument('--production-seeds', type=int, nargs='+', default=[42, 2025, 7],
+                        help='Seeds to use in production mode (default: 42 2025 7)')
+
     args = parser.parse_args()
+
+    # Check if production mode is enabled (multi-seed training)
+    if args.production_mode:
+        return run_production_training(args)
 
     # Set seed
     set_seed(args.seed)
@@ -1479,5 +1489,263 @@ def main():
     return 0
 
 
+def run_production_training(base_args):
+    """
+    Run multi-seed production training and aggregate results.
+
+    Args:
+        base_args: Parsed arguments from main()
+
+    Returns:
+        Exit code (0 = success)
+    """
+    import numpy as np
+    from datetime import datetime
+
+    seeds = base_args.production_seeds
+    base_output_dir = base_args.output_dir
+    results_all_seeds = []
+
+    print("\n" + "="*80)
+    print("PRODUCTION MODE: MULTI-SEED TRAINING")
+    print("="*80)
+    print(f"Seeds: {seeds}")
+    print(f"Base output: {base_output_dir}")
+    print("="*80 + "\n")
+
+    for seed_idx, seed in enumerate(seeds):
+        print(f"\n{'='*80}")
+        print(f"TRAINING WITH SEED: {seed} ({seed_idx + 1}/{len(seeds)})")
+        print(f"{'='*80}\n")
+
+        # Create seed-specific output directory
+        seed_output_dir = base_output_dir / f"seed_{seed}"
+        seed_output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Update args for this seed
+        args_copy = argparse.Namespace(**vars(base_args))
+        args_copy.seed = seed
+        args_copy.output_dir = seed_output_dir
+        args_copy.production_mode = False  # Disable to avoid recursion
+
+        # Set seed
+        set_seed(seed)
+
+        try:
+            # Run training for this seed
+            # We'll call the existing training logic by recreating the setup
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+            # Load tokenizer
+            tokenizer = AutoTokenizer.from_pretrained(args_copy.model_name)
+
+            # Validate max_seq_len
+            model_config = AutoConfig.from_pretrained(args_copy.model_name)
+            max_position_embeddings = getattr(model_config, 'max_position_embeddings', 512)
+            if args_copy.max_seq_len > max_position_embeddings:
+                args_copy.max_seq_len = max_position_embeddings
+
+            # Load datasets
+            train_dataset = CodeDataset(
+                args_copy.train_data, tokenizer, args_copy.max_seq_len,
+                args_copy.use_weights, args_copy.use_code_features
+            )
+            val_dataset = CodeDataset(
+                args_copy.val_data, tokenizer, args_copy.max_seq_len,
+                use_weights=False, use_features=args_copy.use_code_features
+            )
+
+            # Quick test mode
+            if args_copy.quick_test:
+                train_dataset.data = train_dataset.data[:100]
+                val_dataset.data = val_dataset.data[:50]
+
+            # Create data loaders
+            if args_copy.use_weighted_sampler:
+                weights = train_dataset.get_sample_weights()
+                sampler = WeightedRandomSampler(
+                    weights=weights, num_samples=len(weights), replacement=True
+                )
+                train_loader = DataLoader(
+                    train_dataset, batch_size=args_copy.batch_size,
+                    sampler=sampler, num_workers=0
+                )
+            else:
+                train_loader = DataLoader(
+                    train_dataset, batch_size=args_copy.batch_size, shuffle=True
+                )
+
+            val_loader = DataLoader(
+                val_dataset, batch_size=args_copy.batch_size, shuffle=False
+            )
+
+            # Initialize model
+            model = EnhancedSQLIntentTransformer(
+                model_name=args_copy.model_name,
+                num_labels=2,
+                hidden_dim=args_copy.hidden_dim,
+                dropout=args_copy.dropout
+            ).to(device)
+
+            # Loss function
+            class_weights = train_dataset.get_class_weights(multiplier=args_copy.weight_multiplier)
+            class_weights = class_weights.to(device)
+
+            if args_copy.focal_loss:
+                criterion = FocalLoss(alpha=class_weights, gamma=args_copy.focal_gamma)
+            else:
+                criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+            # Optimizer
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=args_copy.lr, weight_decay=args_copy.weight_decay
+            )
+
+            # LR Finder with fallback
+            if args_copy.find_lr and args_copy.lr_override is None:
+                try:
+                    cache_key = compute_cache_key_for_lr_finder(train_dataset, args_copy)
+                    cached_lr = load_cached_lr(
+                        cache_key, cache_dir=Path('models/transformer/.lr_cache'),
+                        max_age_hours=args_copy.lr_cache_max_age,
+                        force_invalidate=args_copy.force_find_lr
+                    )
+
+                    if cached_lr is not None:
+                        suggested_lr = cached_lr
+                        print(f"[+] Using cached LR: {suggested_lr:.2e}")
+                    else:
+                        print("[*] Running LR Finder...")
+                        lr_finder = LRFinder(model, optimizer, criterion, device)
+                        suggested_lr, lr_history = lr_finder.find(
+                            train_loader, num_iter=args_copy.lr_finder_iterations
+                        )
+                        suggested_lr = max(1e-5, min(suggested_lr, 5e-5))  # Conservative cap
+                        save_lr_to_cache(cache_key, suggested_lr, Path('models/transformer/.lr_cache'))
+                        print(f"[+] Suggested LR: {suggested_lr:.2e}")
+
+                    # Update LR
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = suggested_lr
+                    args_copy.lr = suggested_lr
+
+                except Exception as e:
+                    print(f"[!] LR Finder failed: {str(e)}")
+                    print(f"[!] Using conservative fallback LR: 2.5e-5")
+                    fallback_lr = 2.5e-5
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = fallback_lr
+                    args_copy.lr = fallback_lr
+
+            # Scheduler
+            num_training_steps = len(train_loader) * args_copy.epochs
+            num_warmup_steps = int(num_training_steps * args_copy.warmup_ratio)
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer, num_warmup_steps=num_warmup_steps,
+                num_training_steps=num_training_steps
+            )
+
+            # Mixed precision scaler
+            scaler = GradScaler() if args_copy.mixed_precision else None
+
+            # Checkpoint manager
+            checkpoint_mgr = CheckpointManager(
+                args_copy.output_dir, s3_bucket=args_copy.s3_bucket,
+                s3_prefix=args_copy.s3_prefix
+            )
+
+            # Save config
+            save_experiment_config(
+                args_copy, args_copy.output_dir,
+                {'train': args_copy.train_data, 'val': args_copy.val_data}
+            )
+
+            # Training loop (simplified - just track best F1)
+            best_val_f1 = 0.0
+
+            for epoch in range(args_copy.epochs):
+                train_loss = train_epoch(
+                    model, train_loader, optimizer, criterion, device,
+                    scaler, scheduler, args_copy.accumulation_steps
+                )
+                val_metrics = evaluate(model, val_loader, device, criterion)
+
+                print(f"Epoch {epoch+1}/{args_copy.epochs}")
+                print(f"  Train Loss: {train_loss:.4f}")
+                print(f"  Val F1: {val_metrics['binary_f1_vulnerable']:.4f}")
+
+                if val_metrics['binary_f1_vulnerable'] > best_val_f1:
+                    best_val_f1 = val_metrics['binary_f1_vulnerable']
+                    checkpoint_mgr.save_checkpoint(
+                        'best_model.pt', model, optimizer, epoch,
+                        {'val_f1': best_val_f1}
+                    )
+
+            # Store result
+            result = {
+                "seed": seed,
+                "best_f1": best_val_f1
+            }
+            results_all_seeds.append(result)
+
+            print(f"\n[+] Seed {seed} complete. Best F1: {best_val_f1:.4f}")
+
+        except Exception as e:
+            print(f"\n[!] Training failed for seed {seed}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            results_all_seeds.append({"seed": seed, "best_f1": 0.0, "error": str(e)})
+
+    # Aggregate results
+    print(f"\n{'='*80}")
+    print("PRODUCTION TRAINING COMPLETE")
+    print(f"{'='*80}\n")
+
+    valid_results = [r for r in results_all_seeds if 'error' not in r]
+
+    if valid_results:
+        f1_scores = [r['best_f1'] for r in valid_results]
+        mean_f1 = np.mean(f1_scores)
+        std_f1 = np.std(f1_scores)
+
+        print(f"Results across {len(valid_results)} seeds:")
+        for r in valid_results:
+            print(f"  Seed {r['seed']}: F1 = {r['best_f1']:.4f}")
+
+        print(f"\nMean F1: {mean_f1:.4f} ± {std_f1:.4f}")
+
+        # Save production summary
+        summary = {
+            "model": "transformer_v17",
+            "timestamp": datetime.now().isoformat(),
+            "seeds": seeds,
+            "results": results_all_seeds,
+            "mean_f1": float(mean_f1),
+            "std_f1": float(std_f1),
+            "best_seed": max(valid_results, key=lambda x: x['best_f1'])['seed'],
+            "best_f1": max(f1_scores)
+        }
+
+        summary_path = base_output_dir / "production_summary.json"
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        print(f"\n[+] Production summary saved: {summary_path}")
+
+    else:
+        print("[!] All seeds failed. Check logs above.")
+        return 1
+
+    return 0
+
+
 if __name__ == '__main__':
+    # Parse args and check for production mode
+    import sys
+    args_namespace = None
+
+    # We need to peek at args to see if production mode is enabled
+    parser = argparse.ArgumentParser(description="Train Enhanced SQL Intent Transformer")
+    # ... (all the parser.add_argument calls are in main(), so we need to call main differently)
+
+    # Actually, let's modify the flow: main() will check for production mode
     sys.exit(main())
