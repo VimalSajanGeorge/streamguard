@@ -1,0 +1,169 @@
+================================================================================
+NOTEBOOK CELL STRUCTURE VERIFICATION REPORT
+Generated: 2025-11-09
+File: StreamGuard_Complete_Training.ipynb
+================================================================================
+
+EXECUTIVE SUMMARY
+================================================================================
+The cells ARE NOT missing code. The issue is PURELY a JSON FORMATTING PROBLEM.
+
+The notebook has been recently modified and reformatted, which stripped the
+trailing newline characters from the source array elements. This breaks the
+Jupyter notebook rendering but does NOT affect the actual code content.
+
+KEY FINDINGS
+================================================================================
+
+1. SOURCE STRUCTURE VERIFICATION
+   
+   Cell 25 (Index 25) - Shows as "Cell 26" in UI:
+   ├─ Cell Type: code
+   ├─ Source Type: list
+   ├─ Total Elements: 137
+   └─ Issue: NO trailing '\n' on any element
+   
+   Cell 26 (Index 26) - Shows as "Cell 27" in UI:
+   ├─ Cell Type: code
+   ├─ Source Type: list
+   ├─ Total Elements: 146
+   └─ Issue: NO trailing '\n' on any element
+
+   BACKUP (for reference):
+   
+   Cell 25 (Index 25):
+   ├─ Source Type: list
+   ├─ Total Elements: 99
+   └─ Format: CORRECT - Each element HAS trailing '\n'
+   
+   Cell 26 (Index 26):
+   ├─ Source Type: list
+   ├─ Total Elements: 98
+   └─ Format: CORRECT - Each element HAS trailing '\n'
+
+
+2. FIRST 5 ELEMENTS COMPARISON
+
+   CURRENT NOTEBOOK:
+   Cell 25 (Index 25) - First 5 lines:
+   [0]: '# Cell 26: Transformer v1.7 Production Training'
+   [1]: '# ============================================================'
+   [2]: '# Multi-seed training with production features:'
+   [3]: '# - 3 seeds: [42, 2025, 7]'
+   [4]: '# - LR Finder runs ONCE before loop (cached for all seeds)'
+   
+   Cell 26 (Index 26) - First 5 lines:
+   [0]: '# Cell 27: GNN v1.7 Production Training'
+   [1]: '# ============================================================'
+   [2]: '# Multi-seed GNN training with:'
+   [3]: '# - Graph data from data/processed/graphs/'
+   [4]: '# - Focal Loss for hard negatives'
+
+   BACKUP NOTEBOOK:
+   Cell 25 (Index 25) - First 5 lines:
+   [0]: '# Cell 25: Transformer v1.7 Production Training\n'
+   [1]: '# ============================================================\n'
+   [2]: '# Multi-seed training with production features:\n'
+   [3]: '# - 3 seeds: [42, 2025, 7]\n'
+   [4]: '# - LR Finder with fallback\n'
+   
+   Cell 26 (Index 26) - First 5 lines:
+   [0]: '# Cell 26: GNN v1.7 Production Training\n'
+   [1]: '# ============================================================\n'
+   [2]: '# Multi-seed GNN training with:\n'
+   [3]: '# - Graph data from data/processed/graphs/\n'
+   [4]: '# - Focal Loss for hard negatives\n'
+
+
+3. CONTENT SIZE ANALYSIS
+
+   Cell 25 (Index 25):
+   ├─ Current: 4,232 characters
+   ├─ Backup:  3,016 characters
+   └─ Difference: +1,216 chars (40% larger)
+   
+   Cell 26 (Index 26):
+   ├─ Current: 4,561 characters
+   ├─ Backup:  3,061 characters
+   └─ Difference: +1,500 chars (49% larger)
+
+
+4. ROOT CAUSE IDENTIFIED
+
+   Issue Type: JSON FORMATTING PROBLEM
+   
+   Problem:
+   - The notebook JSON was reformatted
+   - A JSON formatter/editor removed trailing '\n' from array elements
+   - This is NOT a data loss - the code is still present
+   - But Jupyter notebooks REQUIRE trailing newlines for proper rendering
+   
+   Evidence:
+   - Element 0 in backup: '# Cell 25: ...\n'
+   - Element 0 in current: '# Cell 26: ...' (NO newline)
+   - This breaks cell display and causes concatenation without line breaks
+   
+   Why content size increased:
+   - The CURRENT notebook has ADDITIONAL CODE beyond the backup
+   - Plus the newline stripping
+   - Cells were renumbered (Cell 25 → Cell 26, Cell 26 → Cell 27)
+
+
+5. JUPYTER RENDERING IMPACT
+
+   Without trailing newlines in source arrays:
+   ├─ Cells display with broken line breaks
+   ├─ Code appears concatenated on single lines
+   ├─ Execution may fail or show syntax errors
+   ├─ Visual rendering is severely impaired
+   └─ Notebook validation will fail
+   
+   With trailing newlines (correct format):
+   ├─ Cells display with proper line breaks
+   ├─ Code is readable and properly formatted
+   ├─ Execution works correctly
+   ├─ Visual rendering is correct
+   └─ Notebook validation passes
+
+
+CONCLUSION
+================================================================================
+
+CELLS 25 AND 26 ARE INTACT - NOT MALFORMED
+
+✓ Both cells are stored as source arrays (list of strings)
+✓ Both cells contain complete code
+✓ No code is missing or deleted
+✓ The content is larger than backup (intentional additions)
+
+BUT: JSON FORMATTING IS BROKEN
+
+✗ Each source element is missing trailing '\n'
+✗ This causes rendering failures in Jupyter
+✗ This causes display/execution issues
+
+RECOMMENDATIONS
+================================================================================
+
+Option 1: Restore from backup
+  - Simplest solution
+  - Gets back to last known-good state
+  - Command: cp StreamGuard_Complete_Training.ipynb.backup StreamGuard_Complete_Training.ipynb
+
+Option 2: Fix the JSON formatting
+  - Restore trailing newlines to all source elements
+  - Preserve the new code additions in cells
+  - More complex but preserves recent changes
+  - Requires Python script to add '\n' to each array element
+
+Option 3: Export and reimport in Jupyter
+  - Open the notebook in Jupyter
+  - Export as .py file
+  - Create fresh notebook from the .py file
+  - Requires careful preservation of cell structure
+
+RECOMMENDED ACTION: Option 1 (Restore from backup)
+  Because the new code in the current version appears to have been added
+  without proper formatting anyway.
+
+================================================================================

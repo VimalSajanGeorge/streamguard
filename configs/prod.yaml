@@ -1,0 +1,125 @@
+# StreamGuard Production Training Configuration
+# Purpose: Full production training for Transformer model on CodeXGlue dataset
+# Expected runtime: 30-60 minutes on A100 GPU
+
+# Training hyperparameters
+batch_size: 64  # Full batch size for A100 (adjust for other GPUs)
+learning_rate: null  # Use LR Finder to determine optimal LR
+epochs: 10  # Full training run
+seed: 42  # Reproducibility (use [42, 2025, 7] for multi-seed runs)
+
+# Performance settings
+mixed_precision: true  # Enable AMP for 2x speedup on modern GPUs
+num_workers: 4  # Parallel data loading (adjust based on CPU cores)
+gradient_accumulation_steps: 1  # Increase if OOM occurs
+
+# Device configuration
+device: "cuda"  # Requires CUDA-capable GPU
+device_map: "auto"  # Automatic device placement
+
+# Checkpoint settings
+checkpoint_dir: "training/outputs/transformer_v17"
+save_checkpoint: true
+checkpoint_every_n_epochs: 1  # Save after each epoch
+save_best_only: true  # Only keep best checkpoint by validation F1
+
+# Logging
+log_every_n_steps: 50  # Log every 50 steps
+verbose: false  # Disable verbose logging for production
+log_format: "jsonl"  # Structured logging for analysis
+
+# Data settings
+max_samples: null  # Use full dataset (~21,854 training samples)
+shuffle: true  # Shuffle for better generalization
+
+# Model settings
+model_name: "microsoft/codebert-base"
+max_seq_length: 512
+dropout: 0.1
+hidden_dropout_prob: 0.1
+attention_probs_dropout_prob: 0.1
+
+# LR Finder
+find_lr: true  # Run LR Finder to determine optimal learning rate
+force_find_lr: false  # Use cached LR if available (within 7 days)
+lr_finder_num_iter: 100  # Quick LR finder (100 iterations)
+lr_finder_min_lr: 1e-7
+lr_finder_max_lr: 1e-3
+
+# LR Scheduler
+use_scheduler: true
+scheduler_type: "cosine"  # Cosine annealing with warm restarts
+warmup_steps: 500  # Warmup for first 500 steps
+
+# Weighted sampler (for class imbalance)
+use_weighted_sampler: true
+class_weights: null  # Auto-calculate from data
+weight_multiplier: 1.2  # Conservative multiplier for minority class
+
+# Validation
+validate_every_n_epochs: 1
+early_stopping_patience: 3  # Stop if no improvement for 3 epochs
+early_stopping_metric: "f1"  # Monitor F1 score
+
+# Gradient clipping
+gradient_clip_norm: 1.0  # Prevent exploding gradients
+
+# Regularization
+weight_decay: 0.01  # L2 regularization
+label_smoothing: 0.0  # Disable label smoothing
+
+# Reproducibility
+deterministic: true  # Enable deterministic algorithms
+cudnn_benchmark: false  # Disable cuDNN benchmarking for reproducibility
+cudnn_deterministic: true  # Enable cuDNN deterministic mode
+
+# Safety features
+use_atomic_writes: true  # Atomic JSON writes to prevent corruption
+collapse_detection: true  # Detect and stop model collapse
+collapse_threshold: 5  # Number of consecutive bad epochs before stopping
+
+# Metrics
+compute_metrics: true
+metrics: ["accuracy", "precision", "recall", "f1", "auc"]
+primary_metric: "f1"  # Primary metric for model selection
+
+# Data paths (adjust these for your environment)
+train_data_path: "data/processed/codexglue/train.jsonl"
+val_data_path: "data/processed/codexglue/valid.jsonl"
+test_data_path: "data/processed/codexglue/test.jsonl"
+
+# Comments
+_description: |
+  Production configuration for Transformer (CodeBERT) training on CodeXGlue.
+
+  This config implements all safety features and best practices:
+  - LR Finder with caching
+  - Mixed precision training (AMP)
+  - Atomic checkpoint saves
+  - Collapse detection
+  - Reproducible training
+  - Weighted sampling for class imbalance
+
+  Multi-seed training (recommended):
+    for seed in 42 2025 7; do
+      python training/train_transformer.py \
+        --config configs/prod.yaml \
+        --seed $seed \
+        --output-dir training/outputs/transformer_v17/seed_$seed
+    done
+
+  Expected metrics:
+    - Training time: 30-60 min per seed on A100
+    - Validation F1: > 0.85 (target: 0.88-0.93)
+    - Reproducibility: ±0.5% F1 across seeds
+
+  Hardware requirements:
+    - GPU: A100 (40GB) or V100 (32GB) or T4 (16GB)
+    - RAM: 16GB+
+    - Disk: 10GB for checkpoints
+
+  Troubleshooting:
+    - OOM error: Reduce batch_size to 32 or 16
+    - Slow training: Ensure mixed_precision=true
+    - Collapse: Check data quality, reduce LR
+    - Low F1: Tune class_weights, increase epochs

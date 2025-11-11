@@ -6,7 +6,9 @@
       "Bash(dir \"C:\\Users\\Vimal Sajan\\streamguard\\data\\raw\\opensource\")",
       "Bash(dir \"C:\\Users\\Vimal Sajan\\streamguard\\data\\raw\\cves\")",
       "Bash(dir \"C:\\Users\\Vimal Sajan\\streamguard\\training\\scripts\\collection\")",
-      "Bash(powershell:*)"
+      "Bash(powershell:*)",
+      "Bash(dir /B \"C:\\Users\\Vimal Sajan\\streamguard\\scripts\")",
+      "Bash(findstr:*)"
     ],
     "deny": [],
     "ask": []

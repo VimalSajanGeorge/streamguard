@@ -52,3 +52,24 @@ docker-compose.override.yml
 
 # Vendor (will be cloned during setup)
 vendor/tree-sitter-c/
+
+# Training outputs
+training/outputs/
+outputs/
+*.tmp
+*.backup
+
+# LR Finder cache
+.lr_cache/
+training/.lr_cache/
+
+# Config overrides (local configs)
+configs/*.local.yaml
+configs/*.local.yml
+
+# Debug logs
+debug_*.log
+debug_*.txt
+
+# Small dataset samples (generated)
+data/sample/

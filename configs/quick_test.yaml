@@ -1,0 +1,64 @@
+# StreamGuard Quick Test Configuration
+# Purpose: Fast smoke test for development and debugging
+# Expected runtime: 2-3 minutes on GPU, 5-10 minutes on CPU
+
+# Training hyperparameters
+batch_size: 4  # Small batch for quick testing
+learning_rate: 2e-5  # Conservative default LR
+epochs: 1  # Single epoch for smoke test
+seed: 42  # Reproducibility
+
+# Performance settings
+mixed_precision: false  # Disable AMP for debugging (slower but more stable)
+num_workers: 0  # Single-threaded data loading for debugging
+gradient_accumulation_steps: 1  # No accumulation for quick test
+
+# Device configuration
+device: "cuda"  # Will fallback to CPU if CUDA unavailable
+device_map: "auto"  # Automatic device placement
+
+# Checkpoint settings
+checkpoint_dir: "outputs/test"
+save_checkpoint: true
+checkpoint_every_n_epochs: 1
+
+# Logging
+log_every_n_steps: 10  # Log every 10 steps
+verbose: true  # Enable verbose logging for debugging
+
+# Data settings
+max_samples: 64  # Limit to 64 samples for quick test
+shuffle: false  # Deterministic order for debugging
+
+# Model settings
+model_name: "microsoft/codebert-base"
+max_seq_length: 512
+dropout: 0.1
+
+# LR Finder
+find_lr: false  # Skip LR finder for quick test
+force_find_lr: false
+
+# Weighted sampler
+use_weighted_sampler: false  # Disable for quick test
+
+# Validation
+validate_every_n_epochs: 1
+early_stopping_patience: null  # Disable early stopping for quick test
+
+# Gradient clipping
+gradient_clip_norm: 1.0
+
+# Comments
+_description: |
+  Quick test configuration for smoke testing the training pipeline.
+  Use this config to verify the training script runs without errors
+  before launching expensive full training runs.
+
+  Usage:
+    python training/train_transformer.py --config configs/quick_test.yaml
+
+  Expected output:
+    - Single epoch completes in 2-3 minutes
+    - Checkpoint saved to outputs/test/
+    - Exit code 0 (success)

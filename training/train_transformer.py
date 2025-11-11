@@ -883,11 +883,14 @@ def main():
     # Data loaders with WeightedRandomSampler option
     if args.use_weighted_sampler:
         # Compute per-sample weights (inverse frequency)
-        class_counts = torch.bincount(torch.tensor(train_labels, dtype=torch.long))
-        class_weights_sampling = 1.0 / class_counts.float()
-        sample_weights = torch.tensor([
-            class_weights_sampling[label] for label in train_labels
-        ])
+        labels_tensor = torch.tensor(train_labels, dtype=torch.long)
+
+        # Ensure both classes appear to avoid division by zero
+        class_counts = torch.bincount(labels_tensor, minlength=2).float()
+        class_counts[class_counts == 0] = 1.0
+
+        class_weights_sampling = 1.0 / class_counts
+        sample_weights = class_weights_sampling[labels_tensor].cpu()
         sampler = WeightedRandomSampler(
             weights=sample_weights,
             num_samples=len(train_dataset),
