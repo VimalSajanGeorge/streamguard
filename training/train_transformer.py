@@ -1361,16 +1361,6 @@ def main():
             writer = None
 
     # Training loop
-    if best_metrics_snapshot is None and last_val_metrics is not None:
-        best_metrics_snapshot = {
-            'precision': last_val_metrics['precision'],
-            'recall': last_val_metrics['recall'],
-            'accuracy': last_val_metrics['accuracy'],
-            'loss': last_val_metrics['loss'],
-            'prediction_distribution': last_val_metrics.get('prediction_distribution', {}).copy()
-        }
-        best_epoch = args.epochs
-
     print("\n" + "="*70)
     print("TRAINING START")
     print("="*70)
@@ -1559,6 +1549,33 @@ def main():
         if patience_counter >= effective_patience:
             print(f"\n[!] Early stopping triggered at epoch {epoch + 1}")
             break
+
+    if best_metrics_snapshot is None:
+        if last_val_metrics is not None:
+            best_metrics_snapshot = {
+                'precision': last_val_metrics['precision'],
+                'recall': last_val_metrics['recall'],
+                'accuracy': last_val_metrics['accuracy'],
+                'loss': last_val_metrics['loss'],
+                'prediction_distribution': last_val_metrics.get('prediction_distribution', {}).copy()
+            }
+            if best_epoch == 0:
+                best_epoch = args.epochs
+        else:
+            # Provide a safe default snapshot so downstream logging/metrics don't break
+            best_metrics_snapshot = {
+                'precision': 0.0,
+                'recall': 0.0,
+                'accuracy': 0.0,
+                'loss': float('inf'),
+                'prediction_distribution': {
+                    'predicted_vulnerable': 0,
+                    'predicted_safe': 0,
+                    'actual_vulnerable': 0,
+                    'actual_safe': 0
+                }
+            }
+            best_epoch = 0
 
     print("\n" + "="*70)
     print("TRAINING COMPLETE")
