@@ -19,7 +19,7 @@ import hashlib
 import subprocess
 import math
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Any
 import sys
 
@@ -551,6 +551,93 @@ def evaluate(
     }
 
     return metrics
+
+
+def collect_validation_outputs(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device
+) -> Dict[str, List[float]]:
+    """
+    Run model over dataloader and collect probabilities/predictions for analysis.
+    """
+    model.eval()
+    probs: List[float] = []
+    preds: List[int] = []
+    labels: List[int] = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            label_tensor = batch['label'].to(device)
+            code_features = batch.get('code_features')
+            if code_features is not None:
+                code_features = code_features.to(device)
+
+            logits = model(input_ids, attention_mask, code_features)
+            probabilities = torch.softmax(logits, dim=1)[:, 1]
+
+            probs.extend(probabilities.cpu().tolist())
+            preds.extend(torch.argmax(logits, dim=1).cpu().tolist())
+            labels.extend(label_tensor.cpu().tolist())
+
+    return {
+        'probs': probs,
+        'preds': preds,
+        'labels': labels
+    }
+
+
+def run_threshold_sweep(
+    probs: List[float],
+    labels: List[int],
+    thresholds: List[float]
+) -> Tuple[List[Dict[str, float]], Optional[Dict[str, float]]]:
+    """
+    Evaluate vulnerable-class metrics across a list of thresholds.
+    """
+    if not probs or not labels:
+        return [], None
+
+    probs_arr = np.array(probs)
+    labels_arr = np.array(labels)
+    sweep_results: List[Dict[str, float]] = []
+    best_entry: Optional[Dict[str, float]] = None
+
+    for threshold in thresholds:
+        preds = (probs_arr >= threshold).astype(int)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            labels_arr, preds, average='binary', pos_label=1, zero_division=0
+        )
+        entry = {
+            'threshold': float(threshold),
+            'precision': float(precision),
+            'recall': float(recall),
+            'f1': float(f1)
+        }
+        sweep_results.append(entry)
+        if best_entry is None or entry['f1'] > best_entry['f1']:
+            best_entry = entry
+
+    return sweep_results, best_entry
+
+
+def compute_confusion_counts(labels: List[int], preds: List[int]) -> Dict[str, int]:
+    """
+    Build confusion matrix counts (TN/FP/FN/TP) for logging/metrics.
+    """
+    if not labels:
+        return {'tn': 0, 'fp': 0, 'fn': 0, 'tp': 0}
+
+    matrix = confusion_matrix(labels, preds, labels=[0, 1])
+    tn, fp, fn, tp = matrix.ravel()
+    return {
+        'tn': int(tn),
+        'fp': int(fp),
+        'fn': int(fn),
+        'tp': int(tp)
+    }
 
 
 def train_epoch(
@@ -1274,11 +1361,24 @@ def main():
             writer = None
 
     # Training loop
+    if best_metrics_snapshot is None and last_val_metrics is not None:
+        best_metrics_snapshot = {
+            'precision': last_val_metrics['precision'],
+            'recall': last_val_metrics['recall'],
+            'accuracy': last_val_metrics['accuracy'],
+            'loss': last_val_metrics['loss'],
+            'prediction_distribution': last_val_metrics.get('prediction_distribution', {}).copy()
+        }
+        best_epoch = args.epochs
+
     print("\n" + "="*70)
     print("TRAINING START")
     print("="*70)
 
     best_val_f1 = 0.0
+    best_epoch = 0
+    best_metrics_snapshot: Optional[Dict[str, Any]] = None
+    last_val_metrics: Optional[Dict[str, Any]] = None
     patience_counter = 0
 
     # Increase patience for quick test (needs more time to stabilize)
@@ -1302,6 +1402,7 @@ def main():
 
         # Evaluate
         val_metrics = evaluate(model, val_loader, device, criterion)
+        last_val_metrics = val_metrics
 
         # CRITICAL FIX: Print prediction distribution to detect collapse
         dist = val_metrics['prediction_distribution']
@@ -1390,7 +1491,7 @@ def main():
         enhanced_metadata = {
             'seed': args.seed,
             'git_commit': get_git_commit(),
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'lr_finder_used': bool(args.find_lr),
             'suggested_lr': float(suggested_lr) if args.find_lr else None,
             'lr_finder_analysis': lr_finder_analysis if lr_finder_analysis else None,
@@ -1405,6 +1506,14 @@ def main():
 
         if is_best:
             best_val_f1 = val_metrics['binary_f1_vulnerable']
+            best_epoch = epoch + 1
+            best_metrics_snapshot = {
+                'precision': val_metrics['precision'],
+                'recall': val_metrics['recall'],
+                'accuracy': val_metrics['accuracy'],
+                'loss': val_metrics['loss'],
+                'prediction_distribution': dist.copy()
+            }
             patience_counter = 0
             print(f"[+] New best model! F1: {best_val_f1:.4f}")
         else:
@@ -1456,6 +1565,73 @@ def main():
     print("="*70)
     print(f"Best validation F1 (vulnerable): {best_val_f1:.4f}")
 
+    # Load best checkpoint for consistent analysis (threshold sweep, confusion matrix)
+    best_checkpoint = checkpoint_mgr.load_checkpoint('best_model.pt')
+    if best_checkpoint:
+        model.load_state_dict(best_checkpoint['model_state_dict'])
+        if best_epoch == 0:
+            best_epoch = best_checkpoint.get('epoch', 0)
+    else:
+        print("[!] WARNING: best_model.pt not found. Using current weights for post-analysis.")
+
+    val_outputs = collect_validation_outputs(model, val_loader, device)
+    num_val_samples = len(val_outputs['labels'])
+    default_threshold = 0.5
+    threshold_candidates = [0.3, 0.4, 0.5, 0.6, 0.7]
+    threshold_sweep_results, recommended_entry = run_threshold_sweep(
+        val_outputs['probs'], val_outputs['labels'], threshold_candidates
+    )
+    recommended_threshold = recommended_entry['threshold'] if recommended_entry else default_threshold
+
+    # Confusion matrix logging at threshold 0.5
+    confusion_counts = {}
+    if val_outputs['probs']:
+        default_preds = (np.array(val_outputs['probs']) >= default_threshold).astype(int)
+        default_pred_list = default_preds.tolist()
+        confusion_counts = compute_confusion_counts(
+            val_outputs['labels'],
+            default_pred_list
+        )
+        print("\nConfusion matrix @ best epoch (threshold=0.5):")
+        print(f"    True Safe:  TN={confusion_counts['tn']}, FP={confusion_counts['fp']}")
+        print(f"    True Vuln:  FN={confusion_counts['fn']}, TP={confusion_counts['tp']}")
+        if recommended_entry:
+            print(f"[info] Recommended threshold (best F1): "
+                  f"{recommended_threshold:.2f} (F1={recommended_entry['f1']:.4f})")
+    else:
+        confusion_counts = {'tn': 0, 'fp': 0, 'fn': 0, 'tp': 0}
+
+    metrics_payload = {
+        'best_f1_vulnerable': float(best_val_f1),
+        'best_precision_vulnerable': float(best_metrics_snapshot['precision']) if best_metrics_snapshot else None,
+        'best_recall_vulnerable': float(best_metrics_snapshot['recall']) if best_metrics_snapshot else None,
+        'best_accuracy': float(best_metrics_snapshot['accuracy']) if best_metrics_snapshot else None,
+        'best_epoch': int(best_epoch),
+        'threshold': default_threshold,
+        'num_val_samples': int(num_val_samples),
+        'prediction_distribution_best': (
+            best_metrics_snapshot.get('prediction_distribution') if best_metrics_snapshot else None
+        ),
+        'threshold_sweep': threshold_sweep_results,
+        'recommended_threshold': float(recommended_threshold),
+        'recommended_f1_vulnerable': (
+            recommended_entry['f1'] if recommended_entry else None
+        ),
+        'recommended_precision_vulnerable': (
+            recommended_entry['precision'] if recommended_entry else None
+        ),
+        'recommended_recall_vulnerable': (
+            recommended_entry['recall'] if recommended_entry else None
+        ),
+        'confusion_matrix_threshold_0_5': confusion_counts,
+        'timestamp': datetime.now(timezone.utc).isoformat()
+    }
+
+    metrics_path = args.output_dir / 'metrics.json'
+    with metrics_path.open('w', encoding='utf-8') as f:
+        json.dump(metrics_payload, f, indent=2)
+    print(f"[ok] Metrics saved to: {metrics_path}")
+
     # Test evaluation if provided
     if args.test_data:
         print("\n" + "="*70)
@@ -1469,10 +1645,10 @@ def main():
             test_dataset, batch_size=args.batch_size, shuffle=False
         )
 
-        # Load best model
-        best_checkpoint = checkpoint_mgr.load_checkpoint('best_model.pt')
-        if best_checkpoint:
-            model.load_state_dict(best_checkpoint['model_state_dict'])
+        # Load best model (reuse cached checkpoint if available)
+        checkpoint_for_test = best_checkpoint or checkpoint_mgr.load_checkpoint('best_model.pt')
+        if checkpoint_for_test:
+            model.load_state_dict(checkpoint_for_test['model_state_dict'])
 
         test_metrics = evaluate(model, test_loader, device, criterion)
 
