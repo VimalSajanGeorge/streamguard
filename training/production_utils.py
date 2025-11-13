@@ -173,8 +173,9 @@ def run_transformer_production(
         val_data: Path to validation data
         output_dir: Output directory
         seeds: List of seeds to use
-        epochs: Number of epochs per seed
-        batch_size: Batch size
+    epochs: Number of epochs per seed
+    batch_size: Batch size
+    model_name: Transformer backbone key passed to fusion trainer
 
     Returns:
         Dictionary with aggregated results
@@ -242,7 +243,8 @@ def run_fusion_production(
     output_dir: str = "training/outputs/fusion_v17",
     seeds: List[int] = [42, 2025, 7],
     epochs: int = 12,
-    batch_size: int = 32
+    batch_size: int = 32,
+    model_name: str = "codebert"
 ) -> Dict[str, Any]:
     """
     Run production Fusion training with multiple seeds.
@@ -264,7 +266,16 @@ def run_fusion_production(
         f"--epochs={epochs}",
         f"--batch-size={batch_size}",
         f"--transformer-checkpoint={transformer_checkpoint}",
-        f"--gnn-checkpoint={gnn_checkpoint}"
+        f"--gnn-checkpoint={gnn_checkpoint}",
+        f"--model-name={model_name}",
+        "--mixed-precision",
+        "--amp-dtype=bf16",
+        "--scheduler=cosine",
+        "--grad-clip-norm=1.0",
+        "--pad-to-multiple-of=8",
+        "--num-workers=4",
+        "--prefetch-factor=2",
+        "--persistent-workers"
     ]
 
     return run_multi_seed_training(

@@ -299,6 +299,15 @@ class EnhancedSQLIntentTransformer(nn.Module):
         Returns:
             Logits [batch, num_labels]
         """
+        features = self.extract_features(input_ids, attention_mask, code_features)
+        logits = self.classifier(features)
+
+        return logits
+
+    def extract_features(self, input_ids, attention_mask, code_features=None):
+        """
+        Return pooled transformer features prior to classification.
+        """
         outputs = self.encoder(
             input_ids=input_ids,
             attention_mask=attention_mask
@@ -323,9 +332,7 @@ class EnhancedSQLIntentTransformer(nn.Module):
             fused = code_emb
 
         fused = self.dropout(fused)
-        logits = self.classifier(fused)
-
-        return logits
+        return fused
 
 
 class S3CheckpointManager:
@@ -647,6 +654,24 @@ def collect_validation_outputs(
     }
 
 
+def dump_validation_logits(output_dir: Path, val_outputs: Dict[str, List[float]]):
+    """
+    Persist validation probabilities/labels for downstream ensembling.
+    """
+    probs = val_outputs.get('probs') or []
+    labels = val_outputs.get('labels') or []
+    if not probs or not labels:
+        print("[warn] No validation probabilities available; skipping dump.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    probs_path = output_dir / 'val_probs.npy'
+    labels_path = output_dir / 'val_labels.npy'
+    np.save(probs_path, np.array(probs, dtype=np.float32))
+    np.save(labels_path, np.array(labels, dtype=np.int64))
+    print(f"[+] Saved validation logits to {probs_path} and {labels_path}")
+
+
 def run_threshold_sweep(
     probs: List[float],
     labels: List[int],
@@ -938,6 +963,8 @@ def main():
                         help='Ignore cached LR, always run LR Finder fresh')
     parser.add_argument('--lr-cache-max-age', type=int, default=168,
                         help='LR cache validity in hours (default: 168 = 1 week)')
+    parser.add_argument('--dump-val-logits', action='store_true', default=False,
+                        help='Persist validation probabilities/labels for ensembling')
 
     # Production mode (multi-seed training)
     parser.add_argument('--production-mode', action='store_true', default=False,
@@ -1785,6 +1812,8 @@ def main():
         print("[!] WARNING: best_model.pt not found. Using current weights for post-analysis.")
 
     val_outputs = collect_validation_outputs(model, val_loader, device)
+    if args.dump_val_logits:
+        dump_validation_logits(args.output_dir, val_outputs)
     num_val_samples = len(val_outputs['labels'])
     default_threshold = 0.5
     threshold_candidates = np.linspace(0.30, 0.70, 41).tolist()

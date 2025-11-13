@@ -328,40 +328,66 @@ class EnhancedTaintFlowGNN(nn.Module):
         else:
             x = self.embedding(x.squeeze(1))  # [num_nodes, embedding_dim]
 
-        # GNN layers
-        for conv in self.convs:
-            x = conv(x, edge_index)
-            x = F.relu(x)
-            x = self.dropout(x)
-
-        # Global pooling (mean + max)
-        mean_pool = global_mean_pool(x, batch)
-        max_pool = global_max_pool(x, batch)
-        graph_embedding = torch.cat([mean_pool, max_pool], dim=1)
-        # Concat optional graph-level features
-        if hasattr(data, 'graph_features'):
-            gf = data.graph_features
-            if gf.ndim == 1:
-                gf = gf.unsqueeze(0).repeat(graph_embedding.size(0), 1) if graph_embedding.size(0) == 1 else gf
-            gf = self.graph_feature_dropout(gf)
-            if gf.shape[0] == graph_embedding.shape[0]:
-                # Expand classifier if not already expanded
-                if self.graph_feature_dim == 0:
-                    self.graph_feature_dim = gf.shape[1]
-                    new_in = self.classifier_in_dim + self.graph_feature_dim
-                    # Rebuild classifier to match new input dim
-                    self.classifier = nn.Sequential(
-                        nn.Linear(new_in, graph_embedding.shape[1] // 2),
-                        nn.ReLU(),
-                        nn.Dropout(self.graph_feature_dropout.p),
-                        nn.Linear(graph_embedding.shape[1] // 2, 2)
-                    )
-                graph_embedding = torch.cat([graph_embedding, gf], dim=1)
+        graph_embedding = self.extract_graph_embedding(data)
 
         # Classification
         logits = self.classifier(graph_embedding)
 
         return logits
+
+    def extract_graph_embedding(self, data):
+        """
+        Return pooled graph embeddings (with optional graph-level features).
+        """
+        if not TORCH_GEOMETRIC_AVAILABLE:
+            raise ImportError("PyTorch Geometric required")
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+
+        # Embed or project nodes
+        if self.using_precomputed:
+            x = self.input_proj(x.float())
+        else:
+            x = self.embedding(x.squeeze(1))
+
+        for conv in self.convs:
+            x = conv(x, edge_index)
+            x = F.relu(x)
+            x = self.dropout(x)
+
+        mean_pool = global_mean_pool(x, batch)
+        max_pool = global_max_pool(x, batch)
+        graph_embedding = torch.cat([mean_pool, max_pool], dim=1)
+
+        if hasattr(data, 'graph_features'):
+            gf = data.graph_features
+            if gf.ndim == 1:
+                repeat_count = graph_embedding.size(0)
+                gf = gf.unsqueeze(0).repeat(repeat_count, 1)
+            gf = self.graph_feature_dropout(gf)
+            if gf.shape[0] != graph_embedding.shape[0]:
+                gf = gf[:graph_embedding.shape[0]]
+
+            if self.graph_feature_dim != gf.shape[1]:
+                self._expand_classifier(gf.shape[1], graph_embedding.shape[1])
+
+            graph_embedding = torch.cat([graph_embedding, gf], dim=1)
+
+        return graph_embedding
+
+    def _expand_classifier(self, gf_dim: int, current_dim: int):
+        """
+        Rebuild classifier layers when additional graph-level features are detected.
+        """
+        self.graph_feature_dim = gf_dim
+        new_in = self.classifier_in_dim + self.graph_feature_dim
+        hidden_dim = max((current_dim + gf_dim) // 2, 2)
+        self.classifier = nn.Sequential(
+            nn.Linear(new_in, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.graph_feature_dropout.p),
+            nn.Linear(hidden_dim, 2)
+        )
+        self.classifier_in_dim = new_in
 
 
 class S3CheckpointManager:
@@ -544,6 +570,19 @@ def collect_validation_outputs(model: nn.Module, dataloader: DataLoader, device:
     return {'probs': probs, 'preds': preds, 'labels': labels}
 
 
+def dump_validation_logits(output_dir: Path, val_outputs: Dict[str, List[float]]):
+    """Persist validation logits for seed ensembling."""
+    probs = val_outputs.get('probs') or []
+    labels = val_outputs.get('labels') or []
+    if not probs or not labels:
+        print("[warn] No validation outputs to dump.")
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    np.save(output_dir / 'val_probs.npy', np.array(probs, dtype=np.float32))
+    np.save(output_dir / 'val_labels.npy', np.array(labels, dtype=np.int64))
+    print(f"[+] Saved validation logits under {output_dir}")
+
+
 def run_threshold_sweep(probs: List[float], labels: List[int], thresholds: List[float]) -> Tuple[List[Dict[str, float]], Optional[Dict[str, float]]]:
     if not probs or not labels:
         return [], None
@@ -706,6 +745,7 @@ def main():
     parser.add_argument('--grad-clip-norm', type=float, default=1.0)
     parser.add_argument('--scheduler', choices=['plateau', 'cosine', 'none'], default='plateau')
     parser.add_argument('--auto-batch-size', action='store_true', help='Auto-detect batch size from graph stats')
+    parser.add_argument('--dump-val-logits', action='store_true', help='Persist validation logits for ensembling')
 
     # Phase 1: LR Finder arguments
     parser.add_argument('--find-lr', action='store_true', help='Run LR Finder before training')
@@ -1285,6 +1325,8 @@ def main():
         model.load_state_dict(best_checkpoint['model_state_dict'])
 
     val_outputs = collect_validation_outputs(model, val_loader, device)
+    if args.dump_val_logits:
+        dump_validation_logits(args.output_dir, val_outputs)
     default_threshold = 0.5
     sweep, best = run_threshold_sweep(val_outputs['probs'], val_outputs['labels'], thresholds=np.linspace(0.30, 0.70, 41).tolist())
     best_threshold = best['threshold'] if best else default_threshold

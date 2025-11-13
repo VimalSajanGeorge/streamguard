@@ -30,7 +30,6 @@ try:
         set_seed
     )
     from train_gnn import EnhancedTaintFlowGNN, GraphDataset as GNNDataset
-    from train_fusion import FusionLayer
     IMPORTS_AVAILABLE = True
 except ImportError as e:
     print(f"[!] Import error: {e}")
