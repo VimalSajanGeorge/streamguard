@@ -1,5 +1,5 @@
 """
-Augment graph JSONL with GraphCodeBERT CLS embeddings (opt-in).
+Augment graph JSONL with GraphCodeBERT embeddings (opt-in).
 
 Reads an input JSONL of code samples and writes an output JSONL with an
 additional field `graph_cls` (list[float] of length 768 by default) for each
@@ -13,8 +13,10 @@ Usage:
       --model-name graphcodebert --max-samples 1000
 
 Notes:
-    - Token mode is intentionally not implemented here to avoid requiring
-      token→node alignment metadata. CLS mode is simpler and safe.
+    - token mode requires per-node text fields. If a sample contains a
+      `node_texts` list (one string per node), a CLS embedding is computed for
+      each element and saved under `node_embeds`. Otherwise token mode is
+      skipped for that sample.
 """
 
 import json
@@ -65,6 +67,7 @@ def main():
     ap.add_argument('--output', type=Path, required=True, help='Output JSONL (augmented)')
     ap.add_argument('--model-name', type=str, default='graphcodebert',
                    choices=['codebert', 'graphcodebert', 'unixcoder'])
+    ap.add_argument('--embedding-type', type=str, default='cls', choices=['cls', 'token'])
     ap.add_argument('--max-samples', type=int, default=None)
     args = ap.parse_args()
 
@@ -85,15 +88,33 @@ def main():
         for line in tqdm(lines, desc='Augmenting'):
             sample = json.loads(line)
             code = sample.get('code') or sample.get('func') or ''
-            cls_vec = compute_cls(tokenizer, model, device, code)
-            if cls_vec is not None:
-                sample['graph_cls'] = cls_vec
-            out.write(json.dumps(sample) + '\n')
+            if args.embedding_type == 'cls':
+                cls_vec = compute_cls(tokenizer, model, device, code)
+                if cls_vec is not None:
+                    sample['graph_cls'] = cls_vec
+            else:
+                # token mode expects node_texts per graph
+                node_texts = sample.get('node_texts')
+                if isinstance(node_texts, list) and node_texts:
+                    node_embeds = []
+                    for txt in node_texts:
+                        vec = compute_cls(tokenizer, model, device, txt)
+                        if vec is None:
+                            vec = [0.0] * 768
+                        node_embeds.append(vec)
+                    sample['node_embeds'] = node_embeds
+        out.write(json.dumps(sample) + '\n')
 
+    dim = 0
+    if args.embedding_type == 'cls':
+        dim = len(sample.get('graph_cls', [])) if 'sample' in locals() else 0
+    else:
+        if 'sample' in locals() and 'node_embeds' in sample and sample['node_embeds']:
+            dim = len(sample['node_embeds'][0])
     meta = {
         'encoder': args.model_name,
-        'feature': 'cls',
-        'dim': len(sample['graph_cls']) if 'graph_cls' in sample else 0
+        'feature': args.embedding_type,
+        'dim': dim
     }
     meta_path = args.output.with_suffix('.encoder_metadata.json')
     with meta_path.open('w', encoding='utf-8') as mf:
@@ -103,4 +124,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

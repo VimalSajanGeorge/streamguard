@@ -264,7 +264,8 @@ class EnhancedTaintFlowGNN(nn.Module):
         hidden_dim: int = 256,
         num_layers: int = 4,
         num_labels: int = 2,
-        dropout: float = 0.3
+        dropout: float = 0.3,
+        precomputed_feature_dim: Optional[int] = None
     ):
         """
         Initialize GNN model.
@@ -282,8 +283,12 @@ class EnhancedTaintFlowGNN(nn.Module):
         if not TORCH_GEOMETRIC_AVAILABLE:
             raise ImportError("PyTorch Geometric required")
 
-        # Node embedding
-        self.embedding = nn.Embedding(node_vocab_size, embedding_dim)
+        # Input handling
+        self.using_precomputed = precomputed_feature_dim is not None
+        if self.using_precomputed:
+            self.input_proj = nn.Linear(precomputed_feature_dim, embedding_dim)
+        else:
+            self.embedding = nn.Embedding(node_vocab_size, embedding_dim)
 
         # GNN layers
         self.convs = nn.ModuleList()
@@ -317,8 +322,11 @@ class EnhancedTaintFlowGNN(nn.Module):
         """
         x, edge_index, batch = data.x, data.edge_index, data.batch
 
-        # Embed nodes
-        x = self.embedding(x.squeeze(1))  # [num_nodes, embedding_dim]
+        # Embed or project nodes
+        if self.using_precomputed:
+            x = self.input_proj(x.float())  # [num_nodes, embedding_dim]
+        else:
+            x = self.embedding(x.squeeze(1))  # [num_nodes, embedding_dim]
 
         # GNN layers
         for conv in self.convs:
@@ -876,7 +884,8 @@ def main():
         embedding_dim=args.embedding_dim,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
-        dropout=args.dropout
+        dropout=args.dropout,
+        precomputed_feature_dim=(args.encoder_feature_dim if args.encoder_features == 'token' else None)
     )
     model.to(device)
 
