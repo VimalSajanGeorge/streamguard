@@ -28,10 +28,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.amp import autocast, GradScaler
-from transformers import (
-    AutoModel, AutoTokenizer, AutoConfig,
-    get_linear_schedule_with_warmup
-)
+from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+
+try:
+    from training.models.backbones import load_backbone
+except ModuleNotFoundError:
+    from models.backbones import load_backbone
 from sklearn.metrics import (
     accuracy_score, precision_recall_fscore_support,
     classification_report, confusion_matrix
@@ -105,7 +107,8 @@ class CodeDataset(Dataset):
         tokenizer,
         max_seq_len: int = 512,
         use_weights: bool = False,
-        use_features: bool = False
+        use_features: bool = False,
+        pad_to_multiple_of: Optional[int] = None
     ):
         """
         Initialize dataset.
@@ -121,6 +124,7 @@ class CodeDataset(Dataset):
         self.max_seq_len = max_seq_len
         self.use_weights = use_weights
         self.use_features = use_features
+        self.pad_to_multiple_of = pad_to_multiple_of
         self.feature_cache = {}  # Cache extracted features
 
         # Load samples
@@ -176,6 +180,7 @@ class CodeDataset(Dataset):
                 max_length=self.max_seq_len,
                 padding='max_length',
                 truncation=True,
+                pad_to_multiple_of=self.pad_to_multiple_of,
                 return_tensors='pt'
             )
             input_ids = encoding['input_ids'].squeeze(0)
@@ -230,29 +235,40 @@ class EnhancedSQLIntentTransformer(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "microsoft/codebert-base",
-        hidden_dim: int = 768,
+        encoder: nn.Module,
+        hidden_dim: Optional[int] = None,
         num_labels: int = 2,
         dropout: float = 0.1,
         use_features: bool = False,
-        feature_dim: int = 10
+        feature_dim: int = 10,
+        pooling: str = 'cls'
     ):
         """
         Initialize transformer model.
 
         Args:
-            model_name: Pre-trained model name
-            hidden_dim: Hidden dimension
+            encoder: Pre-loaded transformer encoder
+            hidden_dim: Hidden dimension (defaults to encoder hidden size)
             num_labels: Number of output labels
             dropout: Dropout rate
             use_features: Whether to use code features
             feature_dim: Dimension of code features
+            pooling: Pooling strategy ('cls' or 'mean')
         """
         super().__init__()
 
-        self.encoder = AutoModel.from_pretrained(model_name)
-        self.dropout = nn.Dropout(dropout)
+        self.encoder = encoder
+        self.pooling = pooling
         self.use_features = use_features
+
+        encoder_hidden = getattr(self.encoder.config, 'hidden_size', None)
+        if hidden_dim is None:
+            if encoder_hidden is None:
+                raise ValueError("hidden_dim must be provided if encoder lacks config.hidden_size")
+            hidden_dim = encoder_hidden
+        self.hidden_dim = hidden_dim
+
+        self.dropout = nn.Dropout(dropout)
 
         # Feature projection and fusion (if using features)
         if use_features:
@@ -283,27 +299,31 @@ class EnhancedSQLIntentTransformer(nn.Module):
         Returns:
             Logits [batch, num_labels]
         """
-        # Get encoder outputs
         outputs = self.encoder(
             input_ids=input_ids,
             attention_mask=attention_mask
         )
 
-        # Use CLS token representation
-        code_emb = outputs.last_hidden_state[:, 0]  # [batch, hidden]
+        last_hidden = outputs.last_hidden_state
+        if self.pooling == 'cls':
+            code_emb = last_hidden[:, 0]
+        elif self.pooling == 'mean':
+            mask = attention_mask.unsqueeze(-1).type_as(last_hidden)
+            summed = (last_hidden * mask).sum(dim=1)
+            denom = mask.sum(dim=1).clamp(min=1e-6)
+            code_emb = summed / denom
+        else:
+            raise ValueError(f"Unsupported pooling strategy: {self.pooling}")
 
-        # Feature fusion (if enabled and features provided)
         if self.use_features and code_features is not None:
-            feat_emb = self.feature_projection(code_features)  # [batch, hidden]
-            combined = torch.cat([code_emb, feat_emb], dim=1)  # [batch, hidden*2]
-            fused = self.fusion(combined)  # [batch, hidden]
+            feat_emb = self.feature_projection(code_features)
+            combined = torch.cat([code_emb, feat_emb], dim=1)
+            fused = self.fusion(combined)
         else:
             fused = code_emb
 
         fused = self.dropout(fused)
-
-        # Classification
-        logits = self.classifier(fused)  # [batch, num_labels]
+        logits = self.classifier(fused)
 
         return logits
 
@@ -453,6 +473,44 @@ class S3CheckpointManager:
                 print(f"[!] S3 download failed: {e}")
 
         return None
+
+
+class ExponentialMovingAverage:
+    """
+    Lightweight EMA tracker for model parameters.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow: Dict[str, torch.Tensor] = {}
+        self.backup: Dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.detach().clone()
+
+    def update(self, model: nn.Module):
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            assert name in self.shadow
+            new_average = (1.0 - self.decay) * param.detach() + self.decay * self.shadow[name]
+            self.shadow[name] = new_average.clone()
+
+    def apply(self, model: nn.Module):
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            self.backup[name] = param.detach().clone()
+            param.data.copy_(self.shadow[name].data)
+
+    def restore(self, model: nn.Module):
+        if not self.backup:
+            return
+        for name, param in model.named_parameters():
+            if name in self.backup:
+                param.data.copy_(self.backup[name].data)
+        self.backup = {}
 
 
 def compute_binary_f1(y_true: np.ndarray, y_pred: np.ndarray, positive_class: int = 1) -> float:
@@ -640,6 +698,23 @@ def compute_confusion_counts(labels: List[int], preds: List[int]) -> Dict[str, i
     }
 
 
+def compute_balanced_accuracy_from_counts(counts: Dict[str, int]) -> float:
+    """
+    Compute balanced accuracy from confusion counts.
+    """
+    tp = counts.get('tp', 0)
+    fp = counts.get('fp', 0)
+    tn = counts.get('tn', 0)
+    fn = counts.get('fn', 0)
+
+    def _safe_div(num: int, denom: int) -> float:
+        return num / denom if denom > 0 else 0.0
+
+    tpr = _safe_div(tp, tp + fn)
+    tnr = _safe_div(tn, tn + fp)
+    return (tpr + tnr) / 2.0
+
+
 def train_epoch(
     model: nn.Module,
     dataloader: DataLoader,
@@ -648,7 +723,10 @@ def train_epoch(
     device: torch.device,
     scheduler: Any,
     scaler: Optional[torch.amp.GradScaler] = None,
-    accumulation_steps: int = 1
+    accumulation_steps: int = 1,
+    grad_clip_norm: float = 0.0,
+    amp_autocast_dtype: torch.dtype = torch.float16,
+    ema: Optional[ExponentialMovingAverage] = None
 ) -> float:
     """
     Train for one epoch.
@@ -683,7 +761,7 @@ def train_epoch(
 
         # Mixed precision training
         if scaler:
-            with autocast(device_type='cuda'):
+            with autocast(device_type='cuda', dtype=amp_autocast_dtype):
                 logits = model(input_ids, attention_mask, code_features)
                 loss = criterion(logits, labels)  # Already reduced to scalar with class weights
                 loss = loss / accumulation_steps
@@ -694,9 +772,9 @@ def train_epoch(
             scaler.scale(loss).backward()
 
             if (step + 1) % accumulation_steps == 0:
-                # CRITICAL FIX: Add gradient clipping
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                if grad_clip_norm and grad_clip_norm > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
 
                 scaler.step(optimizer)
                 scaler.update()
@@ -704,6 +782,8 @@ def train_epoch(
 
                 # CRITICAL FIX: Step scheduler per-step (not per-epoch)
                 scheduler.step()
+                if ema:
+                    ema.update(model)
 
         else:
             logits = model(input_ids, attention_mask, code_features)
@@ -715,14 +795,16 @@ def train_epoch(
             loss.backward()
 
             if (step + 1) % accumulation_steps == 0:
-                # CRITICAL FIX: Add gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                if grad_clip_norm and grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
 
                 optimizer.step()
                 optimizer.zero_grad()
 
                 # CRITICAL FIX: Step scheduler per-step (not per-epoch)
                 scheduler.step()
+                if ema:
+                    ema.update(model)
 
     return running_loss / len(dataloader)
 
@@ -749,7 +831,13 @@ def save_experiment_config(args: argparse.Namespace, output_dir: Path, data_path
             'warmup_ratio': args.warmup_ratio,
             'max_seq_len': args.max_seq_len,
             'dropout': args.dropout,
-            'accumulation_steps': args.accumulation_steps
+            'accumulation_steps': args.accumulation_steps,
+            'scheduler': args.scheduler,
+            'grad_clip_norm': args.grad_clip_norm,
+            'ema': args.ema,
+            'ema_decay': args.ema_decay,
+            'amp_dtype': args.amp_dtype,
+            'pad_to_multiple_of': args.pad_to_multiple_of
         },
         'dataset_checksums': {
             split: compute_file_checksum(path)
@@ -773,8 +861,19 @@ def main():
     parser.add_argument('--test-data', type=Path, default=None, help='Test data path')
 
     # Model
-    parser.add_argument('--model-name', type=str, default='microsoft/codebert-base', help='Base model')
-    parser.add_argument('--hidden-dim', type=int, default=768, help='Hidden dimension')
+    parser.add_argument(
+        '--model-name',
+        type=str,
+        choices=['codebert', 'graphcodebert', 'unixcoder'],
+        default='codebert',
+        help='Transformer backbone key'
+    )
+    parser.add_argument(
+        '--hidden-dim',
+        type=int,
+        default=None,
+        help='Hidden dimension override (defaults to backbone hidden size)'
+    )
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
 
     # Training
@@ -797,6 +896,24 @@ def main():
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--mixed-precision', action='store_true', help='Use mixed precision')
     parser.add_argument('--quick-test', action='store_true', help='Quick test with 100 samples')
+    parser.add_argument('--scheduler', choices=['linear', 'cosine'], default='linear',
+                        help='LR scheduler type (default: linear warmup/decay)')
+    parser.add_argument('--grad-clip-norm', type=float, default=1.0,
+                        help='Gradient clipping norm (set 0 to disable)')
+    parser.add_argument('--ema', action='store_true', help='Enable EMA for model parameters')
+    parser.add_argument('--ema-decay', type=float, default=0.999, help='EMA decay factor')
+    parser.add_argument('--amp-dtype', choices=['fp16', 'bf16'], default='fp16',
+                        help='Autocast dtype when using mixed precision (default: fp16)')
+    parser.add_argument('--pad-to-multiple-of', type=int, default=None,
+                        help='Pad sequence length to a multiple (e.g., 8) for tensor core efficiency')
+    parser.add_argument('--num-workers', type=int, default=0,
+                        help='Number of DataLoader workers (default: 0)')
+    parser.add_argument('--prefetch-factor', type=int, default=2,
+                        help='Prefetch batches per worker (only when num-workers > 0)')
+    parser.add_argument('--persistent-workers', action='store_true',
+                        help='Reuse worker processes between epochs (requires num-workers > 0)')
+    parser.add_argument('--drop-last', action='store_true',
+                        help='Drop last incomplete batch during training DataLoader')
 
     # NEW: Stability & accuracy flags
     parser.add_argument('--use-weighted-sampler', action='store_true', default=False,
@@ -844,20 +961,19 @@ def main():
     # Create output directory
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save experiment config
-    data_paths = {'train': args.train_data, 'val': args.val_data}
-    if args.test_data:
-        data_paths['test'] = args.test_data
-    save_experiment_config(args, args.output_dir, data_paths)
+    # Load backbone components
+    tokenizer, encoder, backbone_hidden_size, pooling_strategy = load_backbone(args.model_name)
+    resolved_backbone = getattr(encoder.config, '_name_or_path', args.model_name)
+    print(f"[*] Loaded backbone '{args.model_name}' ({resolved_backbone})")
 
-    # Load tokenizer
-    print(f"[*] Loading tokenizer: {args.model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    if args.hidden_dim is None:
+        args.hidden_dim = backbone_hidden_size
+    else:
+        print(f"[*] Using hidden_dim override: {args.hidden_dim} (backbone default {backbone_hidden_size})")
 
     # CRITICAL: Validate max_seq_len against model's position embeddings limit
-    # CodeBERT/RoBERTa has max position embeddings of 514 (512 + 2 special tokens)
-    model_config = AutoConfig.from_pretrained(args.model_name)
-    max_position_embeddings = getattr(model_config, 'max_position_embeddings', 512)
+    encoder_config = getattr(encoder, 'config', None)
+    max_position_embeddings = getattr(encoder_config, 'max_position_embeddings', args.max_seq_len)
 
     if args.max_seq_len > max_position_embeddings:
         print(f"\n[!] WARNING: max_seq_len ({args.max_seq_len}) exceeds model limit ({max_position_embeddings})")
@@ -866,12 +982,28 @@ def main():
         args.max_seq_len = max_position_embeddings
         print(f"[+] Updated max_seq_len: {args.max_seq_len}\n")
 
+    # Save experiment config (after hyperparameters are finalized)
+    data_paths = {'train': args.train_data, 'val': args.val_data}
+    if args.test_data:
+        data_paths['test'] = args.test_data
+    save_experiment_config(args, args.output_dir, data_paths)
+
     # Load datasets
     train_dataset = CodeDataset(
-        args.train_data, tokenizer, args.max_seq_len, args.use_weights, args.use_code_features
+        args.train_data,
+        tokenizer,
+        args.max_seq_len,
+        use_weights=args.use_weights,
+        use_features=args.use_code_features,
+        pad_to_multiple_of=args.pad_to_multiple_of
     )
     val_dataset = CodeDataset(
-        args.val_data, tokenizer, args.max_seq_len, use_weights=False, use_features=args.use_code_features
+        args.val_data,
+        tokenizer,
+        args.max_seq_len,
+        use_weights=False,
+        use_features=args.use_code_features,
+        pad_to_multiple_of=args.pad_to_multiple_of
     )
 
     # Quick test mode
@@ -968,6 +1100,19 @@ def main():
     print(f"    Class weights: Safe={weight_safe:.4f}, Vulnerable={weight_vulnerable:.4f}\n")
 
     # Data loaders with WeightedRandomSampler option
+    pin_memory = torch.cuda.is_available()
+    def _loader_kwargs(drop_last: bool) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {
+            'batch_size': args.batch_size,
+            'num_workers': args.num_workers,
+            'pin_memory': pin_memory,
+            'drop_last': drop_last
+        }
+        if args.num_workers > 0:
+            kwargs['prefetch_factor'] = args.prefetch_factor
+            kwargs['persistent_workers'] = args.persistent_workers
+        return kwargs
+
     if args.use_weighted_sampler:
         # Compute per-sample weights (inverse frequency)
         labels_tensor = torch.tensor(train_labels, dtype=torch.long)
@@ -983,24 +1128,26 @@ def main():
             num_samples=len(train_dataset),
             replacement=True
         )
+        sampler_kwargs = _loader_kwargs(drop_last=args.drop_last)
         train_loader = DataLoader(
             train_dataset,
-            batch_size=args.batch_size,
             sampler=sampler,  # sampler and shuffle are mutually exclusive!
-            num_workers=0
+            **sampler_kwargs
         )
         print(f"[*] Using WeightedRandomSampler (inverse-frequency)")
     else:
+        shuffle_kwargs = _loader_kwargs(drop_last=args.drop_last)
         train_loader = DataLoader(
             train_dataset,
-            batch_size=args.batch_size,
             shuffle=True,  # Only when no sampler
-            num_workers=0
+            **shuffle_kwargs
         )
 
     # Validation loader (always shuffle=False, never sampler)
+    val_loader_kwargs = _loader_kwargs(drop_last=False)
+    val_loader_kwargs.pop('drop_last', None)
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0
+        val_dataset, shuffle=False, **val_loader_kwargs
     )
 
     # Model
@@ -1009,17 +1156,22 @@ def main():
     if args.quick_test:
         print(f"[*] Quick test mode: dropout set to 0.0 (disabled)")
 
-    print(f"[*] Initializing model: {args.model_name}")
+    print(f"[*] Initializing model with backbone: {resolved_backbone}")
     model = EnhancedSQLIntentTransformer(
-        model_name=args.model_name,
+        encoder=encoder,
         hidden_dim=args.hidden_dim,
         dropout=dropout_val,
-        use_features=args.use_code_features
+        use_features=args.use_code_features,
+        pooling=pooling_strategy
     )
     model.to(device)
 
     if args.use_code_features:
         print(f"[*] Code features enabled: 10 metrics + fusion layer")
+
+    ema = ExponentialMovingAverage(model, decay=args.ema_decay) if args.ema else None
+    if ema:
+        print(f"[*] EMA enabled (decay={args.ema_decay})")
 
     # CRITICAL FIX: Learning rate scaling for large batch sizes
     import math
@@ -1143,16 +1295,26 @@ def main():
     warmup_steps = max(warmup_steps, 10)  # Minimum 10 steps
     warmup_steps = min(warmup_steps, int(0.2 * total_steps))  # Max 20% of training
 
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps
-    )
+    def _build_scheduler(opt):
+        if args.scheduler == 'cosine':
+            return get_cosine_schedule_with_warmup(
+                opt,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_steps
+            )
+        return get_linear_schedule_with_warmup(
+            opt,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps
+        )
+
+    scheduler = _build_scheduler(optimizer)
 
     print(f"[*] Scheduler config:")
     print(f"    Total steps: {total_steps}")
     print(f"    Warmup steps: {warmup_steps} ({warmup_steps/total_steps*100:.1f}%)")
     print(f"    Warmup ratio: {warmup_ratio}")
+    print(f"    Type: {args.scheduler}")
 
     # Loss function with Focal Loss option
     if args.focal_loss:
@@ -1182,13 +1344,35 @@ def main():
 
     # Mixed precision training (with safe defaults)
     use_amp = args.mixed_precision and torch.cuda.is_available()
+    amp_dtype = torch.float16
+    requested_bf16 = args.amp_dtype.lower() == 'bf16'
+    bf16_supported = False
+    if torch.cuda.is_available():
+        if hasattr(torch.cuda, 'is_bf16_supported'):
+            try:
+                bf16_supported = torch.cuda.is_bf16_supported()
+            except Exception:
+                bf16_supported = False
+        else:
+            try:
+                major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+                bf16_supported = major >= 8
+            except Exception:
+                bf16_supported = False
+    if requested_bf16:
+        if bf16_supported:
+            amp_dtype = torch.bfloat16
+        else:
+            print("[!] Requested bf16 AMP but GPU/driver does not support it. Falling back to fp16.")
+
     if use_amp:
-        # Create scaler without device argument (deprecated)
         scaler = torch.amp.GradScaler()
-        print(f"[+] Mixed precision training enabled (AMP)")
+        print(f"[+] Mixed precision training enabled (AMP dtype={amp_dtype})")
     else:
         scaler = None
         print(f"[+] Mixed precision training disabled")
+        if requested_bf16:
+            print("[i] AMP dtype flag ignored because mixed precision is disabled.")
 
     # LR Finder with caching and validation (optional - run before training to auto-detect optimal LR)
     lr_finder_analysis = None  # Store for checkpoint metadata
@@ -1328,11 +1512,7 @@ def main():
             warmup_steps = max(warmup_steps, 10)
             warmup_steps = min(warmup_steps, int(0.2 * total_steps))
 
-            scheduler = get_linear_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=warmup_steps,
-                num_training_steps=total_steps
-            )
+            scheduler = _build_scheduler(optimizer)
 
             print(f"[+] Optimizer and scheduler rebuilt with suggested LR")
         else:
@@ -1386,11 +1566,22 @@ def main():
 
         # Train (CRITICAL FIX: Pass scheduler to train_epoch)
         train_loss = train_epoch(
-            model, train_loader, optimizer, criterion,
-            device, scheduler, scaler, args.accumulation_steps
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            device,
+            scheduler,
+            scaler,
+            args.accumulation_steps,
+            grad_clip_norm=args.grad_clip_norm,
+            amp_autocast_dtype=amp_dtype,
+            ema=ema
         )
 
-        # Evaluate
+        # Evaluate (EMA weights if enabled)
+        if ema:
+            ema.apply(model)
         val_metrics = evaluate(model, val_loader, device, criterion)
         last_val_metrics = val_metrics
 
@@ -1493,6 +1684,8 @@ def main():
         checkpoint_mgr.save_checkpoint(
             epoch + 1, model, optimizer, scheduler, val_metrics, is_best, enhanced_metadata
         )
+        if ema:
+            ema.restore(model)
 
         if is_best:
             best_val_f1 = val_metrics['binary_f1_vulnerable']
@@ -1594,29 +1787,52 @@ def main():
     val_outputs = collect_validation_outputs(model, val_loader, device)
     num_val_samples = len(val_outputs['labels'])
     default_threshold = 0.5
-    threshold_candidates = [0.3, 0.4, 0.5, 0.6, 0.7]
+    threshold_candidates = np.linspace(0.30, 0.70, 41).tolist()
     threshold_sweep_results, recommended_entry = run_threshold_sweep(
         val_outputs['probs'], val_outputs['labels'], threshold_candidates
     )
     recommended_threshold = recommended_entry['threshold'] if recommended_entry else default_threshold
 
-    # Confusion matrix logging at threshold 0.5
-    confusion_counts = {}
+    # Confusion matrix logging and derived metrics
+    confusion_counts = {'tn': 0, 'fp': 0, 'fn': 0, 'tp': 0}
+    best_confusion_counts = None
+    default_precision = 0.0
+    default_recall = 0.0
+    default_f1 = 0.0
     if val_outputs['probs']:
-        default_preds = (np.array(val_outputs['probs']) >= default_threshold).astype(int)
-        default_pred_list = default_preds.tolist()
+        probs_arr = np.array(val_outputs['probs'])
+        labels_arr = np.array(val_outputs['labels'])
+        default_preds_arr = (probs_arr >= default_threshold).astype(int)
+        default_pred_list = default_preds_arr.tolist()
         confusion_counts = compute_confusion_counts(
-            val_outputs['labels'],
+            labels_arr.tolist(),
             default_pred_list
+        )
+        default_precision, default_recall, default_f1, _ = precision_recall_fscore_support(
+            labels_arr,
+            default_preds_arr,
+            average='binary',
+            pos_label=1,
+            zero_division=0
         )
         print("\nConfusion matrix @ best epoch (threshold=0.5):")
         print(f"    True Safe:  TN={confusion_counts['tn']}, FP={confusion_counts['fp']}")
         print(f"    True Vuln:  FN={confusion_counts['fn']}, TP={confusion_counts['tp']}")
+
         if recommended_entry:
             print(f"[info] Recommended threshold (best F1): "
                   f"{recommended_threshold:.2f} (F1={recommended_entry['f1']:.4f})")
+            best_pred_arr = (probs_arr >= recommended_threshold).astype(int)
+            best_confusion_counts = compute_confusion_counts(
+                labels_arr.tolist(),
+                best_pred_arr.tolist()
+            )
     else:
-        confusion_counts = {'tn': 0, 'fp': 0, 'fn': 0, 'tp': 0}
+        default_pred_list = []
+
+    balanced_accuracy_at_best = None
+    if best_confusion_counts:
+        balanced_accuracy_at_best = compute_balanced_accuracy_from_counts(best_confusion_counts)
 
     metrics_payload = {
         'best_f1_vulnerable': float(best_val_f1),
@@ -1625,6 +1841,18 @@ def main():
         'best_accuracy': float(best_metrics_snapshot['accuracy']) if best_metrics_snapshot else None,
         'best_epoch': int(best_epoch),
         'threshold': default_threshold,
+        'f1_at_0_5': float(default_f1),
+        'precision_at_0_5': float(default_precision),
+        'recall_at_0_5': float(default_recall),
+        'f1_at_best_threshold': (
+            float(recommended_entry['f1']) if recommended_entry else None
+        ),
+        'best_threshold_by_f1': (
+            float(recommended_threshold) if recommended_entry else None
+        ),
+        'balanced_accuracy_at_best_threshold': (
+            float(balanced_accuracy_at_best) if balanced_accuracy_at_best is not None else None
+        ),
         'num_val_samples': int(num_val_samples),
         'prediction_distribution_best': (
             best_metrics_snapshot.get('prediction_distribution') if best_metrics_snapshot else None
@@ -1641,6 +1869,7 @@ def main():
             recommended_entry['recall'] if recommended_entry else None
         ),
         'confusion_matrix_threshold_0_5': confusion_counts,
+        'confusion_matrix_best_threshold': best_confusion_counts,
         'timestamp': datetime.now(timezone.utc).isoformat()
     }
 
@@ -1656,10 +1885,17 @@ def main():
         print("="*70)
 
         test_dataset = CodeDataset(
-            args.test_data, tokenizer, args.max_seq_len, use_weights=False, use_features=args.use_code_features
+            args.test_data,
+            tokenizer,
+            args.max_seq_len,
+            use_weights=False,
+            use_features=args.use_code_features,
+            pad_to_multiple_of=args.pad_to_multiple_of
         )
+        test_loader_kwargs = _loader_kwargs(drop_last=False)
+        test_loader_kwargs.pop('drop_last', None)
         test_loader = DataLoader(
-            test_dataset, batch_size=args.batch_size, shuffle=False
+            test_dataset, shuffle=False, **test_loader_kwargs
         )
 
         # Load best model (reuse cached checkpoint if available)
@@ -1732,29 +1968,41 @@ def run_production_training(base_args):
             # We'll call the existing training logic by recreating the setup
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-            # Load tokenizer
-            tokenizer = AutoTokenizer.from_pretrained(args_copy.model_name)
+            # Load backbone for this seed
+            tokenizer, encoder, backbone_hidden_size, pooling_strategy = load_backbone(args_copy.model_name)
+            resolved_backbone = getattr(encoder.config, '_name_or_path', args_copy.model_name)
+            print(f"[*] Seed {seed}: backbone '{args_copy.model_name}' ({resolved_backbone})")
+
+            if args_copy.hidden_dim is None:
+                args_copy.hidden_dim = backbone_hidden_size
 
             # Validate max_seq_len
-            model_config = AutoConfig.from_pretrained(args_copy.model_name)
-            max_position_embeddings = getattr(model_config, 'max_position_embeddings', 512)
+            max_position_embeddings = getattr(encoder.config, 'max_position_embeddings', args_copy.max_seq_len)
             if args_copy.max_seq_len > max_position_embeddings:
                 args_copy.max_seq_len = max_position_embeddings
 
             # Load datasets
             train_dataset = CodeDataset(
-                args_copy.train_data, tokenizer, args_copy.max_seq_len,
-                args_copy.use_weights, args_copy.use_code_features
+                args_copy.train_data,
+                tokenizer,
+                args_copy.max_seq_len,
+                use_weights=args_copy.use_weights,
+                use_features=args_copy.use_code_features,
+                pad_to_multiple_of=args_copy.pad_to_multiple_of
             )
             val_dataset = CodeDataset(
-                args_copy.val_data, tokenizer, args_copy.max_seq_len,
-                use_weights=False, use_features=args_copy.use_code_features
+                args_copy.val_data,
+                tokenizer,
+                args_copy.max_seq_len,
+                use_weights=False,
+                use_features=args_copy.use_code_features,
+                pad_to_multiple_of=args_copy.pad_to_multiple_of
             )
 
             # Quick test mode
             if args_copy.quick_test:
-                train_dataset.data = train_dataset.data[:100]
-                val_dataset.data = val_dataset.data[:50]
+                train_dataset.samples = train_dataset.samples[:100]
+                val_dataset.samples = val_dataset.samples[:50]
 
             # Create data loaders
             if args_copy.use_weighted_sampler:
@@ -1777,10 +2025,12 @@ def run_production_training(base_args):
 
             # Initialize model
             model = EnhancedSQLIntentTransformer(
-                model_name=args_copy.model_name,
+                encoder=encoder,
                 num_labels=2,
                 hidden_dim=args_copy.hidden_dim,
-                dropout=args_copy.dropout
+                dropout=args_copy.dropout,
+                use_features=args_copy.use_code_features,
+                pooling=pooling_strategy
             ).to(device)
 
             # Loss function
