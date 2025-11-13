@@ -115,7 +115,9 @@ class GraphDataset(Dataset):
     def __init__(
         self,
         data_path: Path,
-        use_weights: bool = False
+        use_weights: bool = False,
+        encoder_features: str = 'none',
+        encoder_feature_dim: int = 768
     ):
         """
         Initialize graph dataset.
@@ -128,6 +130,8 @@ class GraphDataset(Dataset):
             raise ImportError("PyTorch Geometric required. Install: pip install torch-geometric")
 
         self.use_weights = use_weights
+        self.encoder_features = encoder_features
+        self.encoder_feature_dim = encoder_feature_dim
         self.graphs = []
         self.node_counts = []
         self.edge_counts = []
@@ -136,39 +140,47 @@ class GraphDataset(Dataset):
 
         with open(data_path, 'r', encoding='utf-8') as f:
             for line in f:
-                sample = json.loads(line.strip())
+                line = line.strip()
+                if not line:
+                    continue
+                sample = json.loads(line)
 
-                # Extract graph components
+                # Extract graph components or fallback
                 ast_nodes = sample.get('ast_nodes', [])
                 edge_index = sample.get('edge_index', [])
-                label = sample.get('label', 0)
-                weight = sample.get('weight', 1.0) if use_weights else 1.0
+                label = int(sample.get('label', sample.get('target', 0)))
+                weight = float(sample.get('weight', 1.0)) if use_weights else 1.0
 
                 if len(ast_nodes) == 0:
-                    continue  # Skip empty graphs
+                    # Fallback: simple sequential graph from code tokens hashed to ids
+                    code = sample.get('code') or sample.get('func') or ''
+                    tokens = [t for t in code.replace('\t', ' ').split() if t]
+                    if not tokens:
+                        continue
+                    ids = [abs(hash(t)) % 1000 for t in tokens]
+                    ast_nodes = ids
+                    edge_index = [[i, i + 1] for i in range(len(ids) - 1)] + [[i + 1, i] for i in range(len(ids) - 1)]
 
-                # Convert to tensors
-                # ast_nodes are node type IDs
-                x = torch.tensor(ast_nodes, dtype=torch.long).unsqueeze(1)  # [num_nodes, 1]
-
-                # edge_index
+                x = torch.tensor(ast_nodes, dtype=torch.long).unsqueeze(1)
                 if len(edge_index) > 0:
                     edge_index_tensor = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
                 else:
-                    # Empty graph - create self-loop
                     edge_index_tensor = torch.tensor([[0], [0]], dtype=torch.long)
-
                 y = torch.tensor([label], dtype=torch.long)
 
-                # Create PyG Data object
-                graph_data = Data(
-                    x=x,
-                    edge_index=edge_index_tensor,
-                    y=y
-                )
+                graph_data = Data(x=x, edge_index=edge_index_tensor, y=y)
 
-                # Store weight as attribute
-                graph_data.weight = torch.tensor([weight], dtype=torch.float)
+                # Optional graph-level encoder features (CLS)
+                if self.encoder_features == 'cls' and 'graph_cls' in sample:
+                    try:
+                        gf = torch.tensor(sample['graph_cls'], dtype=torch.float32)
+                        if gf.ndim == 1:
+                            graph_data.graph_features = gf
+                    except Exception:
+                        pass
+
+                if use_weights:
+                    graph_data.weight = torch.tensor([weight], dtype=torch.float)
 
                 self.graphs.append(graph_data)
                 self.node_counts.append(len(ast_nodes))
@@ -281,9 +293,13 @@ class EnhancedTaintFlowGNN(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-        # Classification head
+        self.graph_feature_dim = 0
+        self.graph_feature_dropout = nn.Dropout(dropout)
+
+        # Classification head (input size may expand when graph_features are present)
+        self.classifier_in_dim = hidden_dim * 2
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),  # *2 for mean+max pooling
+            nn.Linear(self.classifier_in_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_labels)
@@ -314,6 +330,25 @@ class EnhancedTaintFlowGNN(nn.Module):
         mean_pool = global_mean_pool(x, batch)
         max_pool = global_max_pool(x, batch)
         graph_embedding = torch.cat([mean_pool, max_pool], dim=1)
+        # Concat optional graph-level features
+        if hasattr(data, 'graph_features'):
+            gf = data.graph_features
+            if gf.ndim == 1:
+                gf = gf.unsqueeze(0).repeat(graph_embedding.size(0), 1) if graph_embedding.size(0) == 1 else gf
+            gf = self.graph_feature_dropout(gf)
+            if gf.shape[0] == graph_embedding.shape[0]:
+                # Expand classifier if not already expanded
+                if self.graph_feature_dim == 0:
+                    self.graph_feature_dim = gf.shape[1]
+                    new_in = self.classifier_in_dim + self.graph_feature_dim
+                    # Rebuild classifier to match new input dim
+                    self.classifier = nn.Sequential(
+                        nn.Linear(new_in, graph_embedding.shape[1] // 2),
+                        nn.ReLU(),
+                        nn.Dropout(self.graph_feature_dropout.p),
+                        nn.Linear(graph_embedding.shape[1] // 2, 2)
+                    )
+                graph_embedding = torch.cat([graph_embedding, gf], dim=1)
 
         # Classification
         logits = self.classifier(graph_embedding)
@@ -686,6 +721,11 @@ def main():
     # Phase 1: Safety arguments
     parser.add_argument('--min-epochs-before-collapse-check', type=int, default=2, help='Min epochs before collapse detection')
 
+    # Encoder features (Stage 3B, opt-in)
+    parser.add_argument('--encoder-features', choices=['none', 'cls', 'token'], default='none',
+                        help='Use encoder-derived features (default: none). token mode not implemented here.')
+    parser.add_argument('--encoder-feature-dim', type=int, default=768, help='Encoder feature dim (CLS/token)')
+
     args = parser.parse_args()
 
     if not TORCH_GEOMETRIC_AVAILABLE:
@@ -703,8 +743,18 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load datasets
-    train_dataset = GraphDataset(args.train_data, args.use_weights)
-    val_dataset = GraphDataset(args.val_data, use_weights=False)
+    train_dataset = GraphDataset(
+        args.train_data,
+        use_weights=args.use_weights,
+        encoder_features=args.encoder_features,
+        encoder_feature_dim=args.encoder_feature_dim
+    )
+    val_dataset = GraphDataset(
+        args.val_data,
+        use_weights=False,
+        encoder_features=args.encoder_features,
+        encoder_feature_dim=args.encoder_feature_dim
+    )
 
     # Quick test
     if args.quick_test:
