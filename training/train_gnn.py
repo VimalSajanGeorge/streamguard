@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, WeightedRandomSampler
+from torch.amp import GradScaler, autocast
 
 try:
     import torch_geometric
@@ -483,13 +484,68 @@ def evaluate(
     }
 
 
+def collect_validation_outputs(model: nn.Module, dataloader: DataLoader, device: torch.device) -> Dict[str, List[float]]:
+    """Collect probabilities, predictions and labels for threshold analysis."""
+    model.eval()
+    probs: List[float] = []
+    preds: List[int] = []
+    labels: List[int] = []
+    with torch.no_grad():
+        for data in dataloader:
+            data = data.to(device)
+            logits = model(data)
+            p = torch.softmax(logits, dim=1)[:, 1]
+            probs.extend(p.cpu().tolist())
+            preds.extend(torch.argmax(logits, dim=1).cpu().tolist())
+            labels.extend(data.y.cpu().tolist())
+    return {'probs': probs, 'preds': preds, 'labels': labels}
+
+
+def run_threshold_sweep(probs: List[float], labels: List[int], thresholds: List[float]) -> Tuple[List[Dict[str, float]], Optional[Dict[str, float]]]:
+    if not probs or not labels:
+        return [], None
+    probs_arr = np.array(probs)
+    labels_arr = np.array(labels)
+    results: List[Dict[str, float]] = []
+    best: Optional[Dict[str, float]] = None
+    for t in thresholds:
+        pred = (probs_arr >= t).astype(int)
+        precision, recall, f1, _ = precision_recall_fscore_support(labels_arr, pred, average='binary', pos_label=1, zero_division=0)
+        entry = {'threshold': float(t), 'precision': float(precision), 'recall': float(recall), 'f1': float(f1)}
+        results.append(entry)
+        if best is None or entry['f1'] > best['f1']:
+            best = entry
+    return results, best
+
+
+def compute_confusion_counts(labels: List[int], preds: List[int]) -> Dict[str, int]:
+    if not labels:
+        return {'tn': 0, 'fp': 0, 'fn': 0, 'tp': 0}
+    from sklearn.metrics import confusion_matrix
+    matrix = confusion_matrix(labels, preds, labels=[0, 1])
+    tn, fp, fn, tp = matrix.ravel()
+    return {'tn': int(tn), 'fp': int(fp), 'fn': int(fn), 'tp': int(tp)}
+
+
+def compute_balanced_accuracy_from_counts(counts: Dict[str, int]) -> float:
+    tp, fp, tn, fn = counts.get('tp', 0), counts.get('fp', 0), counts.get('tn', 0), counts.get('fn', 0)
+    def _safe(num, den):
+        return num / den if den > 0 else 0.0
+    tpr = _safe(tp, tp + fn)
+    tnr = _safe(tn, tn + fp)
+    return (tpr + tnr) / 2.0
+
+
 def train_epoch(
     model: nn.Module,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
-    scaler: Optional[torch.amp.GradScaler] = None
+    scaler: Optional[GradScaler] = None,
+    grad_clip_norm: float = 1.0,
+    amp_dtype: Optional[torch.dtype] = None,
+    scheduler: Optional[Any] = None
 ) -> float:
     """Train for one epoch (with gradient clipping)."""
     model.train()
@@ -500,8 +556,13 @@ def train_epoch(
 
         optimizer.zero_grad()
 
-        logits = model(data)
-        loss = criterion(logits, data.y)
+        if scaler is not None and amp_dtype is not None and device.type == 'cuda':
+            with autocast(device_type='cuda', dtype=amp_dtype):
+                logits = model(data)
+                loss = criterion(logits, data.y)
+        else:
+            logits = model(data)
+            loss = criterion(logits, data.y)
 
         # Apply sample weights if available
         if hasattr(data, 'weight'):
@@ -514,8 +575,9 @@ def train_epoch(
         if scaler is not None:
             # If AMP is enabled, unscale before clipping
             scaler.unscale_(optimizer)
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        if grad_clip_norm and grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
 
         if scaler is not None:
             # If AMP is enabled, use scaler for optimizer step
@@ -525,6 +587,12 @@ def train_epoch(
             optimizer.step()
 
         total_loss += loss.item()
+        # Step per-batch for step schedulers
+        if scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            try:
+                scheduler.step()
+            except Exception:
+                pass
 
     return total_loss / len(dataloader)
 
@@ -586,6 +654,14 @@ def main():
     parser.add_argument('--s3-prefix', type=str, default='checkpoints/gnn')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--quick-test', action='store_true')
+    parser.add_argument('--num-workers', type=int, default=0)
+    parser.add_argument('--prefetch-factor', type=int, default=2)
+    parser.add_argument('--persistent-workers', action='store_true')
+    parser.add_argument('--drop-last', action='store_true')
+    parser.add_argument('--mixed-precision', action='store_true')
+    parser.add_argument('--amp-dtype', choices=['fp16', 'bf16'], default='fp16')
+    parser.add_argument('--grad-clip-norm', type=float, default=1.0)
+    parser.add_argument('--scheduler', choices=['plateau', 'cosine', 'none'], default='plateau')
     parser.add_argument('--auto-batch-size', action='store_true', help='Auto-detect batch size from graph stats')
 
     # Phase 1: LR Finder arguments
@@ -707,24 +783,41 @@ def main():
         print(f"[+] Weighted sampler created (resamples minority class)")
 
     # Data loaders
+    pin_memory = torch.cuda.is_available()
+    def _loader_kwargs(drop_last: bool) -> Dict[str, Any]:
+        kw: Dict[str, Any] = {
+            'batch_size': args.batch_size,
+            'num_workers': args.num_workers,
+            'pin_memory': pin_memory,
+            'drop_last': drop_last
+        }
+        if args.num_workers > 0:
+            kw['prefetch_factor'] = args.prefetch_factor
+            kw['persistent_workers'] = args.persistent_workers
+        return kw
+
     if sampler is not None:
         # PyG DataLoader with sampler (shuffle MUST be False)
+        sampler_kwargs = _loader_kwargs(drop_last=args.drop_last)
         train_loader = DataLoader(
             train_dataset,
-            batch_size=args.batch_size,
             sampler=sampler,
-            shuffle=False  # Required when using sampler
+            shuffle=False,  # Required when using sampler
+            **sampler_kwargs
         )
         print(f"[+] Train loader: using weighted sampler (shuffle=False)")
     else:
+        shuffle_kwargs = _loader_kwargs(drop_last=args.drop_last)
         train_loader = DataLoader(
             train_dataset,
-            batch_size=args.batch_size,
-            shuffle=True
+            shuffle=True,
+            **shuffle_kwargs
         )
         print(f"[+] Train loader: random shuffle (no sampler)")
 
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    val_kwargs = _loader_kwargs(drop_last=False)
+    val_kwargs.pop('drop_last', None)
+    val_loader = DataLoader(val_dataset, shuffle=False, **val_kwargs)
 
     # Model
     print(f"[*] Initializing GNN model")
@@ -745,9 +838,15 @@ def main():
     )
 
     # Scheduler
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5
-    )
+    if args.scheduler == 'cosine':
+        total_steps = max(1, len(train_loader) * args.epochs)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+    elif args.scheduler == 'none':
+        scheduler = None
+    else:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.5, patience=5
+        )
 
     # Loss function (with focal loss support)
     if args.focal_loss:
@@ -956,12 +1055,32 @@ def main():
         f.write('epoch,train_loss,val_loss,val_acc,val_precision,val_recall,val_f1,pred_vulnerable,pred_safe\n')
     print(f"[+] CSV metrics will be saved to: {csv_path}")
 
+    # AMP scaler/dtype
+    scaler = None
+    amp_dtype = None
+    if args.mixed_precision and torch.cuda.is_available():
+        scaler = GradScaler()
+        if args.amp_dtype == 'bf16':
+            try:
+                major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+                amp_dtype = torch.bfloat16 if major >= 8 else torch.float16
+                if major < 8:
+                    print('[!] bf16 requested but not supported; falling back to fp16')
+            except Exception:
+                amp_dtype = torch.float16
+        else:
+            amp_dtype = torch.float16
+
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
         print("-" * 70)
 
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
+        train_loss = train_epoch(
+            model, train_loader, optimizer, criterion, device,
+            scaler=scaler, grad_clip_norm=args.grad_clip_norm, amp_dtype=amp_dtype,
+            scheduler=scheduler if isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR) else None
+        )
 
         # Evaluate
         val_metrics = evaluate(model, val_loader, device, criterion)
@@ -1053,7 +1172,8 @@ def main():
             f.flush()
 
         # Step scheduler
-        scheduler.step(val_metrics['binary_f1_vulnerable'])
+        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(val_metrics['binary_f1_vulnerable'])
 
         # PHASE 1: Prepare enhanced metadata for checkpoint
         enhanced_metadata = {
@@ -1099,6 +1219,41 @@ def main():
     print("TRAINING COMPLETE")
     print("="*70)
     print(f"Best validation F1 (vulnerable): {best_val_f1:.4f}")
+
+    # Save extended validation metrics JSON
+    best_checkpoint = checkpoint_mgr.load_checkpoint('best_model.pt')
+    if best_checkpoint:
+        model.load_state_dict(best_checkpoint['model_state_dict'])
+
+    val_outputs = collect_validation_outputs(model, val_loader, device)
+    default_threshold = 0.5
+    sweep, best = run_threshold_sweep(val_outputs['probs'], val_outputs['labels'], thresholds=np.linspace(0.30, 0.70, 41).tolist())
+    best_threshold = best['threshold'] if best else default_threshold
+
+    default_preds = (np.array(val_outputs['probs']) >= default_threshold).astype(int).tolist()
+    cm_default = compute_confusion_counts(val_outputs['labels'], default_preds)
+    cm_best = None
+    if best:
+        best_preds = (np.array(val_outputs['probs']) >= best_threshold).astype(int).tolist()
+        cm_best = compute_confusion_counts(val_outputs['labels'], best_preds)
+    balanced_at_best = compute_balanced_accuracy_from_counts(cm_best) if cm_best else None
+
+    from sklearn.metrics import f1_score
+    metrics_payload = {
+        'best_f1_vulnerable': float(best_val_f1),
+        'f1_at_0_5': float(f1_score(val_outputs['labels'], default_preds)),
+        'f1_at_best_threshold': (float(best['f1']) if best else None),
+        'best_threshold_by_f1': float(best_threshold) if best else None,
+        'balanced_accuracy_at_best_threshold': float(balanced_at_best) if balanced_at_best is not None else None,
+        'threshold_sweep': sweep,
+        'confusion_matrix_threshold_0_5': cm_default,
+        'confusion_matrix_best_threshold': cm_best,
+        'timestamp': datetime.now().isoformat()
+    }
+    metrics_path = args.output_dir / 'metrics.json'
+    with open(metrics_path, 'w', encoding='utf-8') as mf:
+        json.dump(metrics_payload, mf, indent=2)
+    print(f"[ok] Metrics saved to: {metrics_path}")
 
     # Test evaluation
     if args.test_data:

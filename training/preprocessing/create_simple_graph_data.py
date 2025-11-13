@@ -10,7 +10,12 @@ This is a MINIMAL implementation to get GNN training started.
 For production, you should use proper AST-based graphs.
 
 Usage:
+    # Default paths (CodeXGLUE under data/processed/codexglue)
     python training/preprocessing/create_simple_graph_data.py
+
+    # Custom output + limit samples (smoke)
+    python training/preprocessing/create_simple_graph_data.py \
+      --output data/processed/graphs_sample --max-samples 200
 
 Outputs:
     data/processed/graphs/train/*.pt - Training graph files
@@ -20,6 +25,7 @@ Outputs:
 import sys
 import json
 from pathlib import Path
+import argparse
 from typing import Dict, Any, List
 import warnings
 
@@ -200,49 +206,50 @@ def main():
     print("=" * 80)
 
     # Paths
-    BASE_DIR = Path("data/processed")
-    TRAIN_JSONL = BASE_DIR / "codexglue/train.jsonl"
-    VAL_JSONL = BASE_DIR / "codexglue/val.jsonl"
+    parser = argparse.ArgumentParser(description="Create simple sequential graphs for GNN training")
+    parser.add_argument('--train-jsonl', type=Path, default=Path('data/processed/codexglue/train.jsonl'))
+    parser.add_argument('--val-jsonl', type=Path, default=Path('data/processed/codexglue/valid.jsonl'))
+    parser.add_argument('--output', type=Path, default=Path('data/processed/graphs'))
+    parser.add_argument('--max-samples', type=int, default=None, help='Limit samples per split (smoke)')
+    parser.add_argument('--force', action='store_true', help='Overwrite existing outputs')
+    args = parser.parse_args()
 
-    OUTPUT_DIR = BASE_DIR / "graphs"
+    BASE_DIR = args.output
+    TRAIN_JSONL = args.train_jsonl
+    VAL_JSONL = args.val_jsonl
+
+    OUTPUT_DIR = BASE_DIR
     TRAIN_OUTPUT = OUTPUT_DIR / "train"
     VAL_OUTPUT = OUTPUT_DIR / "val"
 
-    # Check if input files exist
-    if not TRAIN_JSONL.exists():
-        print(f"\n[!] ERROR: Training data not found at {TRAIN_JSONL}")
-        print("[!] Please ensure data is available before running this script.")
+    # Guard existing outputs unless --force
+    if (TRAIN_OUTPUT.exists() or VAL_OUTPUT.exists()) and not args.force:
+        print(f"[!] Output directories already exist under {OUTPUT_DIR}. Use --force to overwrite.")
+        # Continue to write stats based on existing graphs if present
+
+    # Check input
+    if not TRAIN_JSONL.exists() or not VAL_JSONL.exists():
+        print(f"\n[!] ERROR: Input files not found. Train={TRAIN_JSONL}, Val={VAL_JSONL}")
         sys.exit(1)
 
-    # Process training set
-    train_stats = process_jsonl_to_graphs(
-        TRAIN_JSONL,
-        TRAIN_OUTPUT,
-        split_name="train",
-        max_samples=None  # Process all
-    )
+    # Process splits
+    train_stats = process_jsonl_to_graphs(TRAIN_JSONL, TRAIN_OUTPUT, split_name="train", max_samples=args.max_samples)
+    val_stats = process_jsonl_to_graphs(VAL_JSONL, VAL_OUTPUT, split_name="val", max_samples=args.max_samples)
 
-    # Process validation set
-    val_stats = process_jsonl_to_graphs(
-        VAL_JSONL,
-        VAL_OUTPUT,
-        split_name="val",
-        max_samples=None  # Process all
-    )
-
-    # Save statistics
-    stats_file = OUTPUT_DIR / "preprocessing_stats.json"
+    # Save metadata
+    stats_file = OUTPUT_DIR / "graphs_metadata.json"
     stats = {
         "train": train_stats,
         "val": val_stats,
-        "note": "Simple sequential graphs - replace with AST graphs for production"
+        "note": "Simple sequential graphs - replace with AST graphs for production",
+        "timestamp": __import__('datetime').datetime.now().isoformat()
     }
-
-    with open(stats_file, 'w') as f:
+    stats_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(stats_file, 'w', encoding='utf-8') as f:
         json.dump(stats, f, indent=2)
 
-    print(f"\n[+] Statistics saved to: {stats_file}")
-    print(f"\n[+] Graph data created successfully!")
+    print(f"\n[+] Metadata saved to: {stats_file}")
+    print(f"\n[+] Graph data ready!")
     print(f"    Train graphs: {TRAIN_OUTPUT}")
     print(f"    Val graphs: {VAL_OUTPUT}")
 
