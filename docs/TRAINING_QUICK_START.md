@@ -1155,3 +1155,53 @@ After successful training:
 ---
 
 **Training should now be stable with F1 â‰¥ 0.75 on full data! ğŸ‰**
+---
+
+## Graph Data Preprocessing (CodexGLUE ? GNN/Fusion)
+
+Run this cell once per runtime before executing any GNN or Fusion notebook cells so the sequential graphs and GraphCodeBERT CLS features are ready:
+
+```python
+import subprocess
+from pathlib import Path
+
+PROJECT_ROOT = Path.cwd()
+TRAIN_JSONL = PROJECT_ROOT / "data/processed/codexglue/train.jsonl"
+VAL_JSONL = PROJECT_ROOT / "data/processed/codexglue/valid.jsonl"
+GRAPH_DIR = PROJECT_ROOT / "data/processed/graphs"
+(GRAPH_DIR / "train").mkdir(parents=True, exist_ok=True)
+(GRAPH_DIR / "val").mkdir(parents=True, exist_ok=True)
+
+def run(cmd):
+    print(" ".join(map(str, cmd)))
+    subprocess.run(cmd, check=True, cwd=PROJECT_ROOT)
+
+print("=== Sequential graph generation ===")
+run([
+    "python", "training/preprocessing/create_simple_graph_data.py",
+    "--train-jsonl", str(TRAIN_JSONL),
+    "--val-jsonl", str(VAL_JSONL),
+    "--output", str(GRAPH_DIR),
+    "--force"
+])
+
+print("\n=== GraphCodeBERT CLS augmentation ===")
+CLS_DIR = PROJECT_ROOT / "data/processed/graphs_encoder"
+CLS_DIR.mkdir(parents=True, exist_ok=True)
+run([
+    "python", "training/preprocessing/augment_graphs_with_encoder.py",
+    "--input", str(TRAIN_JSONL),
+    "--output", str(CLS_DIR / "train.jsonl"),
+    "--model-name", "graphcodebert",
+    "--embedding-type", "cls"
+])
+run([
+    "python", "training/preprocessing/augment_graphs_with_encoder.py",
+    "--input", str(VAL_JSONL),
+    "--output", str(CLS_DIR / "val.jsonl"),
+    "--model-name", "graphcodebert",
+    "--embedding-type", "cls"
+])
+```
+
+> **v1.8.0 Note:** `create_simple_graph_data.py` now creates its output folders internally, so reruns no longer fail with “returned non-zero exit status 2”.

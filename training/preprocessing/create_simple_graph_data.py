@@ -232,9 +232,23 @@ def main():
         print(f"\n[!] ERROR: Input files not found. Train={TRAIN_JSONL}, Val={VAL_JSONL}")
         sys.exit(1)
 
+    # Ensure output directories exist before writing .pt files
+    TRAIN_OUTPUT.mkdir(parents=True, exist_ok=True)
+    VAL_OUTPUT.mkdir(parents=True, exist_ok=True)
+
     # Process splits
-    train_stats = process_jsonl_to_graphs(TRAIN_JSONL, TRAIN_OUTPUT, split_name="train", max_samples=args.max_samples)
-    val_stats = process_jsonl_to_graphs(VAL_JSONL, VAL_OUTPUT, split_name="val", max_samples=args.max_samples)
+    train_stats = process_jsonl_to_graphs(
+        TRAIN_JSONL,
+        TRAIN_OUTPUT,
+        split_name="train",
+        max_samples=args.max_samples
+    )
+    val_stats = process_jsonl_to_graphs(
+        VAL_JSONL,
+        VAL_OUTPUT,
+        split_name="val",
+        max_samples=args.max_samples
+    )
 
     # Save metadata
     stats_file = OUTPUT_DIR / "graphs_metadata.json"
