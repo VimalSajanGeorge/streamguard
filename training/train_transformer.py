@@ -890,8 +890,8 @@ def main():
         '--model-name',
         type=str,
         choices=['codebert', 'graphcodebert', 'unixcoder'],
-        default='codebert',
-        help='Transformer backbone key'
+        default='graphcodebert',
+        help='Transformer backbone key (default: graphcodebert)'
     )
     parser.add_argument(
         '--hidden-dim',
@@ -945,10 +945,15 @@ def main():
                         help='Use WeightedRandomSampler for class balance (recommended for imbalanced data)')
     parser.add_argument('--lr-override', type=float, default=None,
                         help='Override LR (bypasses all scaling)')
-    parser.add_argument('--weight-multiplier', type=float, default=1.5,
+    parser.add_argument('--weight-multiplier', type=float, default=1.0,
                         help='Multiplier for minority class weight (1.0-2.0 range)')
-    parser.add_argument('--use-code-features', action='store_true', default=False,
+    parser.add_argument('--use-code-features', dest='use_code_features',
+                        action='store_true',
                         help='Add 10 code metrics as additional features (+5-10 F1 points)')
+    parser.add_argument('--no-code-features', dest='use_code_features',
+                        action='store_false',
+                        help='Disable auxiliary code metrics features')
+    parser.set_defaults(use_code_features=True)
     parser.add_argument('--focal-loss', action='store_true', default=False,
                         help='Use Focal Loss instead of CrossEntropy (helps with hard negatives)')
     parser.add_argument('--focal-gamma', type=float, default=2.0,

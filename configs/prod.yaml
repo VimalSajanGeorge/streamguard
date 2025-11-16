@@ -33,7 +33,7 @@ max_samples: null  # Use full dataset (~21,854 training samples)
 shuffle: true  # Shuffle for better generalization
 
 # Model settings
-model_name: "microsoft/codebert-base"
+model_name: "microsoft/graphcodebert-base"
 max_seq_length: 512
 dropout: 0.1
 hidden_dropout_prob: 0.1
@@ -54,7 +54,7 @@ warmup_steps: 500  # Warmup for first 500 steps
 # Weighted sampler (for class imbalance)
 use_weighted_sampler: true
 class_weights: null  # Auto-calculate from data
-weight_multiplier: 1.2  # Conservative multiplier for minority class
+weight_multiplier: 1.0  # Conservative multiplier for minority class
 
 # Validation
 validate_every_n_epochs: 1
@@ -87,6 +87,7 @@ primary_metric: "f1"  # Primary metric for model selection
 train_data_path: "data/processed/codexglue/train.jsonl"
 val_data_path: "data/processed/codexglue/valid.jsonl"
 test_data_path: "data/processed/codexglue/test.jsonl"
+use_code_features: true
 
 # Comments
 _description: |
