@@ -39,6 +39,22 @@ from sklearn.metrics import (
     classification_report, confusion_matrix
 )
 
+# Ensure repo root is importable so optional modules like `core.features` resolve
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# Optional code-features import (graceful fallback when unavailable)
+import warnings as _warnings
+CODE_FEATURES_AVAILABLE = True
+_CODE_FEATURES_IMPORT_ERROR = None
+_EXTRACT_METRICS_FN = None
+try:
+    from core.features.code_metrics import extract_basic_metrics as _EXTRACT_METRICS_FN  # type: ignore
+except Exception as _exc:
+    CODE_FEATURES_AVAILABLE = False
+    _CODE_FEATURES_IMPORT_ERROR = _exc
+
 # Optional: boto3 for S3 checkpointing
 try:
     import boto3
@@ -123,9 +139,12 @@ class CodeDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.use_weights = use_weights
-        self.use_features = use_features
+        # Enable features only if requested and the optional module is available
+        self.use_features = bool(use_features and CODE_FEATURES_AVAILABLE)
         self.pad_to_multiple_of = pad_to_multiple_of
         self.feature_cache = {}  # Cache extracted features
+        self._features_warned = False
+        self._runtime_feature_warned = False
 
         # Load samples
         self.samples = []
@@ -143,6 +162,14 @@ class CodeDataset(Dataset):
                 self.weights.append(weight)
 
         print(f"[+] Loaded {len(self.samples)} samples")
+
+        # If features were requested but unavailable, warn once (not per sample)
+        if use_features and not CODE_FEATURES_AVAILABLE and not self._features_warned:
+            _warnings.warn(
+                f"Code features disabled: {_CODE_FEATURES_IMPORT_ERROR}",
+                RuntimeWarning
+            )
+            self._features_warned = True
 
         # Label distribution
         labels = [s['label'] for s in self.samples]
@@ -200,9 +227,9 @@ class CodeDataset(Dataset):
         if self.use_features:
             if idx not in self.feature_cache:
                 try:
-                    from core.features.code_metrics import extract_basic_metrics
-                    metrics = extract_basic_metrics(sample['code'])
-
+                    metrics = _EXTRACT_METRICS_FN(sample['code']) if _EXTRACT_METRICS_FN else None
+                    if metrics is None:
+                        raise RuntimeError("metrics extractor not available")
                     # Normalize features (simple standardization)
                     features = [
                         metrics['loc'] / 100.0,
@@ -216,13 +243,14 @@ class CodeDataset(Dataset):
                         metrics['try_blocks'] / 5.0,
                         metrics['string_ops'] / 10.0
                     ]
-                    self.feature_cache[idx] = torch.tensor(
-                        features, dtype=torch.float32
-                    )
+                    self.feature_cache[idx] = torch.tensor(features, dtype=torch.float32)
                 except Exception as e:
-                    # Fallback: zero vector if extraction fails
-                    import warnings
-                    warnings.warn(f"Feature extraction failed for sample {idx}: {str(e)}")
+                    if not self._runtime_feature_warned:
+                        _warnings.warn(
+                            f"Feature extraction disabled at runtime due to error: {e}",
+                            RuntimeWarning
+                        )
+                        self._runtime_feature_warned = True
                     self.feature_cache[idx] = torch.zeros(10, dtype=torch.float32)
 
             result['code_features'] = self.feature_cache[idx]
