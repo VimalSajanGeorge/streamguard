@@ -10,14 +10,8 @@
 
 Build a universal local detection agent that runs on developers' machines and integrates with any IDE through REST/WebSocket APIs and JSON-RPC protocol.
 
-**Key Features:**
-- **FastAPI Server**: REST + WebSocket + JSON-RPC endpoints
-- **Cross-Platform File Monitor**: inotify (Linux), FSEvents (macOS), ReadDirectoryChangesW (Windows)
-- **Incremental Analysis**: Diff-based detection with caching
-- **Universal IDE Support**: Works with VS Code, IntelliJ, Vim, Emacs, any editor
-- **Real-Time Updates**: WebSocket streaming
-- **Docker Deployment**: Containerized with compose
-- **Low Latency**: <100ms response time
+
+
 
 **Deliverables:**
 - ✅ FastAPI agent server with JSON-RPC

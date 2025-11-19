@@ -26,7 +26,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, WeightedRandomSampler
-from torch.amp import GradScaler, autocast
+try:
+    from torch.amp import GradScaler, autocast
+except (ImportError, AttributeError):
+    from torch.cuda.amp import GradScaler, autocast
 
 try:
     import torch_geometric
@@ -101,12 +104,23 @@ def get_git_commit() -> str:
 
 
 def compute_file_checksum(file_path: Path) -> str:
-    """Compute SHA256 checksum."""
-    sha256 = hashlib.sha256()
-    with open(file_path, 'rb') as f:
-        for chunk in iter(lambda: f.read(8192), b''):
-            sha256.update(chunk)
-    return sha256.hexdigest()
+    """Compute SHA256 checksum for files or directories."""
+    if file_path.is_file():
+        sha256 = hashlib.sha256()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+
+    if file_path.is_dir():
+        sha256 = hashlib.sha256()
+        for sub_path in sorted(p for p in file_path.rglob('*') if p.is_file()):
+            rel = sub_path.relative_to(file_path).as_posix()
+            sha256.update(rel.encode('utf-8'))
+            sha256.update(str(sub_path.stat().st_size).encode('utf-8'))
+        return sha256.hexdigest()
+
+    return 'missing'
 
 
 class GraphDataset(Dataset):
@@ -123,7 +137,7 @@ class GraphDataset(Dataset):
         Initialize graph dataset.
 
         Args:
-            data_path: Path to preprocessed JSONL
+            data_path: Path to preprocessed graphs (.jsonl file or directory of .pt/.jsonl files)
             use_weights: Whether to use sample weights
         """
         if not TORCH_GEOMETRIC_AVAILABLE:
@@ -132,34 +146,84 @@ class GraphDataset(Dataset):
         self.use_weights = use_weights
         self.encoder_features = encoder_features
         self.encoder_feature_dim = encoder_feature_dim
-        self.graphs = []
-        self.node_counts = []
-        self.edge_counts = []
+        self.graphs: List[Data] = []
+        self.node_counts: List[int] = []
+        self.edge_counts: List[int] = []
+        self.uses_precomputed_features: bool = False
+        self.precomputed_feature_dim: Optional[int] = None
 
-        print(f"[*] Loading graph dataset from {data_path}")
+        self.data_path = Path(data_path)
+        if not self.data_path.exists():
+            raise FileNotFoundError(f"Graph data not found at {self.data_path}")
 
-        with open(data_path, 'r', encoding='utf-8') as f:
+        if self.data_path.is_dir():
+            print(f"[*] Loading graph dataset from directory {self.data_path}")
+            self._load_from_directory(self.data_path)
+        else:
+            print(f"[*] Loading graph dataset from {self.data_path}")
+            self._load_from_jsonl(self.data_path)
+
+        if not self.graphs:
+            raise RuntimeError(f"No graphs were loaded from {self.data_path}")
+
+        print(f"[+] Loaded {len(self.graphs)} graphs")
+
+        labels = [g.y.item() for g in self.graphs]
+        vuln_count = sum(labels)
+        safe_count = len(labels) - vuln_count
+
+        print(f"    Vulnerable: {vuln_count} ({vuln_count/len(labels):.1%})")
+        print(f"    Safe: {safe_count} ({safe_count/len(labels):.1%})")
+        if self.uses_precomputed_features and self.precomputed_feature_dim:
+            print(f"    Detected precomputed node features (dim={self.precomputed_feature_dim})")
+
+    def _load_from_directory(self, data_dir: Path) -> None:
+        pt_files = sorted(data_dir.glob('*.pt'))
+        jsonl_files = sorted(data_dir.glob('*.jsonl'))
+
+        if pt_files:
+            for pt_file in pt_files:
+                try:
+                    data = torch.load(pt_file)
+                    if not isinstance(data, Data):
+                        continue
+                    if self.use_weights and not hasattr(data, 'weight'):
+                        data.weight = torch.tensor([1.0], dtype=torch.float)
+                    self._register_graph(data)
+                except Exception as exc:
+                    print(f"[!] Failed to load graph {pt_file}: {exc}")
+        elif jsonl_files:
+            for jsonl_file in jsonl_files:
+                self._load_from_jsonl(jsonl_file)
+        else:
+            raise FileNotFoundError(
+                f"No .pt or .jsonl files found under {data_dir}"
+            )
+
+    def _load_from_jsonl(self, file_path: Path) -> None:
+        with open(file_path, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 sample = json.loads(line)
 
-                # Extract graph components or fallback
                 ast_nodes = sample.get('ast_nodes', [])
                 edge_index = sample.get('edge_index', [])
                 label = int(sample.get('label', sample.get('target', 0)))
-                weight = float(sample.get('weight', 1.0)) if use_weights else 1.0
+                weight = float(sample.get('weight', 1.0)) if self.use_weights else 1.0
 
                 if len(ast_nodes) == 0:
-                    # Fallback: simple sequential graph from code tokens hashed to ids
                     code = sample.get('code') or sample.get('func') or ''
                     tokens = [t for t in code.replace('\t', ' ').split() if t]
                     if not tokens:
                         continue
                     ids = [abs(hash(t)) % 1000 for t in tokens]
                     ast_nodes = ids
-                    edge_index = [[i, i + 1] for i in range(len(ids) - 1)] + [[i + 1, i] for i in range(len(ids) - 1)]
+                    edge_index = (
+                        [[i, i + 1] for i in range(len(ids) - 1)] +
+                        [[i + 1, i] for i in range(len(ids) - 1)]
+                    )
 
                 x = torch.tensor(ast_nodes, dtype=torch.long).unsqueeze(1)
                 if len(edge_index) > 0:
@@ -170,7 +234,6 @@ class GraphDataset(Dataset):
 
                 graph_data = Data(x=x, edge_index=edge_index_tensor, y=y)
 
-                # Optional graph-level encoder features (CLS)
                 if self.encoder_features == 'cls' and 'graph_cls' in sample:
                     try:
                         gf = torch.tensor(sample['graph_cls'], dtype=torch.float32)
@@ -179,22 +242,29 @@ class GraphDataset(Dataset):
                     except Exception:
                         pass
 
-                if use_weights:
+                if self.use_weights:
                     graph_data.weight = torch.tensor([weight], dtype=torch.float)
 
-                self.graphs.append(graph_data)
-                self.node_counts.append(len(ast_nodes))
-                self.edge_counts.append(len(edge_index))
+                self._register_graph(graph_data)
 
-        print(f"[+] Loaded {len(self.graphs)} graphs")
+    def _register_graph(self, graph_data: Data) -> None:
+        self.graphs.append(graph_data)
+        if hasattr(graph_data, 'x') and graph_data.x is not None:
+            if graph_data.x.ndim == 1:
+                graph_data.x = graph_data.x.unsqueeze(-1)
+            if graph_data.x.dtype in (torch.float32, torch.float64):
+                graph_data.x = graph_data.x.float()
+                self.uses_precomputed_features = True
+                self.precomputed_feature_dim = graph_data.x.shape[1]
+            else:
+                graph_data.x = graph_data.x.long()
+        else:
+            graph_data.x = torch.zeros((1, 1), dtype=torch.long)
 
-        # Statistics
-        labels = [g.y.item() for g in self.graphs]
-        vuln_count = sum(labels)
-        safe_count = len(labels) - vuln_count
-
-        print(f"    Vulnerable: {vuln_count} ({vuln_count/len(labels):.1%})")
-        print(f"    Safe: {safe_count} ({safe_count/len(labels):.1%})")
+        node_count = int(getattr(graph_data, 'num_nodes', graph_data.x.size(0)))
+        edge_count = int(graph_data.edge_index.size(1)) if hasattr(graph_data, 'edge_index') else 0
+        self.node_counts.append(node_count)
+        self.edge_counts.append(edge_count)
 
     def __len__(self):
         return len(self.graphs)
@@ -918,6 +988,18 @@ def main():
     val_loader = DataLoader(val_dataset, shuffle=False, **val_kwargs)
 
     # Model
+    # Determine node feature mode
+    precomputed_dim = None
+    if train_dataset.uses_precomputed_features:
+        precomputed_dim = train_dataset.precomputed_feature_dim
+        if not val_dataset.uses_precomputed_features:
+            print("[!] Warning: train graphs have float features but val graphs do not. Falling back to embedding mode.")
+            precomputed_dim = None
+        elif val_dataset.precomputed_feature_dim != precomputed_dim:
+            print("[!] Warning: train/val node feature dims differ. Using train dim and truncating if needed.")
+    elif args.encoder_features == 'token':
+        precomputed_dim = args.encoder_feature_dim
+
     print(f"[*] Initializing GNN model")
     model = EnhancedTaintFlowGNN(
         node_vocab_size=args.node_vocab_size,
@@ -925,7 +1007,7 @@ def main():
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
-        precomputed_feature_dim=(args.encoder_feature_dim if args.encoder_features == 'token' else None)
+        precomputed_feature_dim=precomputed_dim
     )
     model.to(device)
 

@@ -63,7 +63,8 @@ aws s3 mb s3://streamguard-ml-v3 --region us-east-1
 python scripts/setup_sagemaker_role.py
 ```
 
-### 4. Run Setup Verification
+### 4
+. Run Setup Verification
 ```bash
 python scripts/verify_enhanced_setup.py
 ```
@@ -71,7 +72,8 @@ python scripts/verify_enhanced_setup.py
 ## Quick Start Commands
 
 ```bash
-# No need to activate virtual environment - UV handles it automatically
+# Activate virtual environment (Windows)
+venv\Scripts\activate
 
 # Start Docker services
 docker-compose up -d
@@ -84,11 +86,11 @@ docker ps
 # Username: neo4j
 # Password: streamguard
 
-# Initialize Neo4j (using UV)
-uv run python scripts/init_neo4j.py
+# Initialize Neo4j
+python scripts/init_neo4j.py
 
-# Verify setup (using UV)
-uv run python scripts/verify_enhanced_setup.py
+# Verify setup
+python scripts/verify_enhanced_setup.py
 ```
 
 ## Docker Container Management
@@ -148,7 +150,10 @@ aws configure
 
 ```
 streamguard/
-├── .claude/agents/          # Claude Code sub-agents
+├── .claude/agents/          # C
+
+
+laude Code sub-agents
 ├── .git/                    # Git repository
 ├── core/                    # Python backend
 │   ├── agents/             # Detection agents
@@ -171,37 +176,3 @@ streamguard/
 │   ├── raw/              # Raw data
 │   ├── processed/        # Processed data
 │   ├── feedback/         # User feedback
-│   └── embeddings/       # Vector embeddings
-├── tests/                 # Test suites
-│   ├── unit/             # Unit tests
-│   ├── integration/      # Integration tests
-│   ├── e2e/              # End-to-end tests
-│   └── benchmarks/       # Performance benchmarks
-├── docs/                  # Documentation
-│   ├── CLAUDE.md          # Main project guide
-│   ├── 01_setup.md        # Setup instructions
-│   ├── guides/            # User guides
-│   ├── prompts/           # Prompt templates
-│   ├── decisions/         # Architecture decisions
-│   └── architecture/      # Architecture docs
-├── scripts/               # Setup & utility scripts
-├── models/                # Trained models
-├── neo4j/                 # Neo4j data (created by Docker)
-├── redis/                 # Redis data (created by Docker)
-├── .gitignore            # Git ignore rules
-├── docker-compose.yml    # Docker services
-├── requirements.txt      # Python dependencies
-└── SETUP_STATUS.md       # This file
-```
-
-## Resources
-
-- [Neo4j Browser](http://localhost:7474) - Username: neo4j, Password: streamguard
-- [Project Documentation](docs/CLAUDE.md)
-- [Setup Guide](docs/01_setup.md)
-- [GitHub Issues](https://github.com/yourusername/streamguard/issues)
-
----
-
-**Setup Progress:** 75% Complete
-**Last Updated:** 2025-10-10

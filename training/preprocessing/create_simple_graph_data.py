@@ -160,7 +160,14 @@ def process_jsonl_to_graphs(
         try:
             # Extract code and label
             code = sample.get('code', '') or sample.get('func', '')
-            label = sample.get('target', 0)
+            raw_label = sample.get('label', sample.get('target', 0))
+            if isinstance(raw_label, bool):
+                label = int(raw_label)
+            else:
+                try:
+                    label = int(raw_label)
+                except (TypeError, ValueError):
+                    label = 0
 
             if not code:
                 stats['failed'] += 1

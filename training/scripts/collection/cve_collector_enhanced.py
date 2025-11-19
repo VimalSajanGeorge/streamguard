@@ -1,43 +1,67 @@
 """Enhanced CVE Collector for StreamGuard data collection.
 
-Collects CVE samples from NVD API 2.0 with GitHub code extraction.
-Implements parallel collection, rate limiting, and caching.
+Collects CVE samples from NVD API 2.0, enriches them with GitHub code diffs,
+and enforces strict quality filters so the downstream CodexGlue/GNN training
+pipeline receives balanced, production-grade samples.
 """
 
-import json
-import time
+from __future__ import annotations
+
+import argparse
+import math
 import re
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
-from datetime import datetime
-from multiprocessing import Pool, cpu_count
-from collections import defaultdict
-import requests
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from base_collector import BaseCollector
+try:
+    # When executed via `python -m training.scripts.collection.cve_collector_enhanced`
+    from .base_collector import BaseCollector
+except ImportError:  # pragma: no cover - fallback for running as script
+    from base_collector import BaseCollector
+
+
+@dataclass(frozen=True)
+class DateWindow:
+    """Represents a contiguous date window when querying the NVD API."""
+
+    start: datetime
+    end: datetime
+
+    def to_api_params(self) -> Tuple[str, str]:
+        """Return the ISO strings expected by the NVD API."""
+        return (
+            self.start.strftime("%Y-%m-%dT00:00:00.000"),
+            self.end.strftime("%Y-%m-%dT23:59:59.999"),
+        )
+
+    def label(self) -> str:
+        """Readable label for logging/caching."""
+        return f"{self.start.date()}_{self.end.date()}"
 
 
 class CVECollectorEnhanced(BaseCollector):
     """Enhanced CVE collector with GitHub code extraction."""
 
-    # NVD API Configuration
+    # API endpoints
     NVD_API_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0"
     GITHUB_API_BASE = "https://api.github.com"
 
-    # Rate limiting (5 requests per 30 seconds for public API)
-    RATE_LIMIT_REQUESTS = 5
-    RATE_LIMIT_WINDOW = 30  # seconds
-
-    # Collection parameters
-    TARGET_SAMPLES = 15000
+    # Default collection parameters (can be overridden via CLI)
+    TARGET_SAMPLES = 15_000
     RESULTS_PER_PAGE = 2000
     START_YEAR = 2020
-    END_YEAR = 2025
+    END_YEAR = datetime.utcnow().year
+    WINDOW_DAYS = 90  # Keep under NVD 120-day constraint while overlapping a bit
 
-    # Extended vulnerability keywords
-    KEYWORDS = [
+    # Vulnerability keywords and CWE hints
+    KEYWORDS: Sequence[str] = (
         "SQL injection",
         "XSS",
         "cross-site scripting",
@@ -49,204 +73,283 @@ class CVECollectorEnhanced(BaseCollector):
         "deserialization",
         "remote code execution",
         "directory traversal",
-        "insecure deserialization"
-    ]
+        "insecure deserialization",
+    )
 
-    def __init__(self, output_dir: str, cache_enabled: bool = True,
-                 github_token: Optional[str] = None):
+    CWE_HINTS = {
+        "SQL injection": "CWE-89",
+        "cross-site scripting": "CWE-79",
+        "path traversal": "CWE-22",
+        "command injection": "CWE-77",
+        "SSRF": "CWE-918",
+        "XXE": "CWE-611",
+    }
+
+    # Rate limit configuration (NVD public limit is 5 req / 30 seconds)
+    NVD_RATE = (5, 30)
+    # GitHub: assume token available -> stay well below 5k/hr, else 60/hr
+    GITHUB_RATE_AUTH = (75, 60)  # 75 requests per 60 seconds
+    GITHUB_RATE_NOAUTH = (30, 60)
+
+    CODE_EXTENSIONS = {
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".java",
+        ".c",
+        ".cpp",
+        ".cs",
+        ".rb",
+        ".php",
+        ".go",
+        ".rs",
+        ".swift",
+        ".kt",
+        ".scala",
+    }
+
+    def __init__(
+        self,
+        output_dir: str,
+        cache_enabled: bool = True,
+        github_token: Optional[str] = None,
+        start_year: int = START_YEAR,
+        end_year: int = END_YEAR,
+        target_samples: int = TARGET_SAMPLES,
+        keywords: Optional[Sequence[str]] = None,
+    ):
         """
         Initialize enhanced CVE collector.
 
         Args:
-            output_dir: Directory to save collected data
-            cache_enabled: Whether to cache API responses
-            github_token: Optional GitHub API token for higher rate limits
+            output_dir: Directory to save collected data.
+            cache_enabled: Enable/disable request caching.
+            github_token: Optional GitHub API token.
+            start_year: Lower bound for CVE published year.
+            end_year: Upper bound (inclusive).
+            target_samples: Total samples to collect.
+            keywords: Optional override for keyword list.
         """
         super().__init__(output_dir, cache_enabled)
 
         self.github_token = github_token
-        self.last_request_times = []
+        self.start_year = start_year
+        self.end_year = end_year
+        self.TARGET_SAMPLES = target_samples
+        self.keywords = list(keywords) if keywords else list(self.KEYWORDS)
 
-        # Configure session with retry strategy
+        # Rate trackers per API namespace
+        self.request_history = {
+            "nvd": deque(),
+            "github": deque(),
+        }
+
+        self.keyword_stats = defaultdict(lambda: {"samples": 0, "windows": 0})
+
+        # Configure resilient HTTP session
         retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
+            total=5,
+            backoff_factor=1.5,
             status_forcelist=[429, 500, 502, 503, 504],
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
 
-        # GitHub authentication
         if self.github_token:
-            self.session.headers.update({
-                'Authorization': f'token {self.github_token}'
-            })
+            self.session.headers.update({"Authorization": f"token {self.github_token}"})
+
+    # ------------------------------------------------------------------ #
+    # Top-level orchestration
+    # ------------------------------------------------------------------ #
 
     def collect(self) -> List[Dict]:
-        """
-        Collect CVE samples with parallel processing by keyword.
+        """Collect CVE samples across keywords and date windows."""
+        date_windows = self._generate_date_windows()
+        per_keyword_cap = math.ceil(self.TARGET_SAMPLES / len(self.keywords))
 
-        Returns:
-            List of collected CVE samples
-        """
-        print(f"\n{'='*80}")
-        print(f"Enhanced CVE Collection Started")
-        print(f"{'='*80}")
-        print(f"Target samples: {self.TARGET_SAMPLES}")
-        print(f"Time range: {self.START_YEAR}-{self.END_YEAR}")
-        print(f"Keywords: {len(self.KEYWORDS)}")
-        print(f"Cache enabled: {self.cache_enabled}")
-        print(f"{'='*80}\n")
+        print(f"\n{'=' * 80}")
+        print("StreamGuard CVE Collection")
+        print(f"{'=' * 80}")
+        print(f"Target samples          : {self.TARGET_SAMPLES}")
+        print(f"Keywords                : {len(self.keywords)}")
+        print(f"Date range              : {self.start_year} - {self.end_year}")
+        print(f"Windows per keyword     : {len(date_windows)} (each {self.WINDOW_DAYS} days)")
+        print(f"Cache enabled           : {self.cache_enabled}")
+        print(f"GitHub token provided   : {bool(self.github_token)}")
+        print(f"{'=' * 80}\n")
 
-        # Collect CVEs in parallel by keyword
-        samples = self.collect_cves_parallel()
-
-        # Deduplicate based on CVE ID
-        samples = self.deduplicate_samples(samples, key='cve_id')
-
-        # Save samples
-        output_file = self.save_samples(samples, 'cve_data.jsonl')
-
-        # Print statistics
-        stats = self.get_stats()
-        print(f"\n{'='*80}")
-        print(f"Collection Complete")
-        print(f"{'='*80}")
-        print(f"Total samples collected: {len(samples)}")
-        print(f"Samples with code: {sum(1 for s in samples if s.get('vulnerable_code'))}")
-        print(f"Errors encountered: {stats['errors_count']}")
-        print(f"Output file: {output_file}")
-        print(f"{'='*80}\n")
-
-        return samples
-
-    def collect_cves_parallel(self) -> List[Dict]:
-        """
-        Collect CVEs in parallel by keyword using multiprocessing.
-
-        Returns:
-            List of collected CVE samples
-        """
-        # Determine number of processes (use fewer to respect rate limits)
-        num_processes = min(cpu_count(), 4)
-
-        print(f"Starting parallel collection with {num_processes} processes...\n")
-
-        all_samples = []
-        samples_per_keyword = self.TARGET_SAMPLES // len(self.KEYWORDS)
-
-        # Process keywords sequentially to better manage rate limits
-        # (parallel processing within each keyword search)
-        for keyword in self.KEYWORDS:
-            print(f"\n--- Processing keyword: '{keyword}' ---")
-            samples = self.collect_by_keyword(keyword, samples_per_keyword)
-            all_samples.extend(samples)
-
-            print(f"Collected {len(samples)} samples for '{keyword}'")
-            print(f"Total samples so far: {len(all_samples)}")
-
-            # Break if we've reached target
+        all_samples: List[Dict] = []
+        for keyword in self.keywords:
             if len(all_samples) >= self.TARGET_SAMPLES:
-                print(f"\nReached target of {self.TARGET_SAMPLES} samples!")
                 break
 
-        return all_samples
+            target_for_keyword = min(
+                per_keyword_cap, self.TARGET_SAMPLES - len(all_samples)
+            )
 
-    def collect_by_keyword(self, keyword: str, max_samples: int) -> List[Dict]:
-        """
-        Collect CVEs for a specific keyword.
+            print(f"\n--- Keyword: {keyword} | Target: {target_for_keyword} ---")
+            keyword_samples = self._collect_keyword(keyword, date_windows, target_for_keyword)
+            all_samples.extend(keyword_samples)
+            self.keyword_stats[keyword]["samples"] = len(keyword_samples)
 
-        Args:
-            keyword: Vulnerability keyword to search for
-            max_samples: Maximum samples to collect for this keyword
+        # Deduplicate by CVE ID so we keep the best copy per vulnerability
+        deduped = self.deduplicate_samples(all_samples, key="cve_id")
+        output_file = self.save_samples(deduped, "cve_data.jsonl")
 
-        Returns:
-            List of CVE samples matching the keyword
-        """
-        samples = []
+        stats = self.get_stats()
+        samples_with_code = sum(1 for s in deduped if s.get("vulnerable_code"))
 
-        # NVD API has 120-day limit, so we need to query in chunks
-        from datetime import datetime, timedelta
+        print(f"\n{'=' * 80}")
+        print("CVE Collection Complete")
+        print(f"{'=' * 80}")
+        print(f"Total samples saved     : {len(deduped)}")
+        print(f"Samples w/ code pairs   : {samples_with_code}")
+        print(f"Errors encountered      : {stats['errors_count']}")
+        print(f"Output file             : {output_file}")
+        print("Per keyword breakdown   :")
+        for keyword, data in self.keyword_stats.items():
+            print(
+                f"  - {keyword:<22} -> {data['samples']:>5} samples "
+                f"across {data['windows']} windows"
+            )
+        print(f"{'=' * 80}\n")
 
-        end_date = datetime.now()
-        # Use last 120 days for recent data
-        start_date = end_date - timedelta(days=119)
+        return deduped
 
+    # ------------------------------------------------------------------ #
+    # Keyword / window processing
+    # ------------------------------------------------------------------ #
+
+    def _collect_keyword(
+        self,
+        keyword: str,
+        date_windows: Sequence[DateWindow],
+        ceiling: int,
+    ) -> List[Dict]:
+        """Collect CVEs for a single keyword across all date windows."""
+        collected: List[Dict] = []
+
+        for window in date_windows:
+            if len(collected) >= ceiling:
+                break
+
+            remaining = ceiling - len(collected)
+            print(
+                f"   Window {window.label()} | remaining target {remaining} | "
+                f"samples so far {len(collected)}"
+            )
+
+            window_samples = self._collect_window(keyword, window, remaining)
+            collected.extend(window_samples)
+            self.keyword_stats[keyword]["windows"] += 1
+
+            if not window_samples:
+                print(f"     No CVEs found for keyword '{keyword}' in this window.")
+
+        return collected
+
+    def _collect_window(
+        self,
+        keyword: str,
+        window: DateWindow,
+        remaining: int,
+    ) -> List[Dict]:
+        """Collect CVEs for a keyword in a specific window."""
+        samples: List[Dict] = []
         start_index = 0
 
-        while len(samples) < max_samples:
-            # Check cache first
-            cache_key = self.make_cache_key('nvd', keyword, start_index,
-                                           start_date.strftime('%Y%m%d'),
-                                           end_date.strftime('%Y%m%d'))
-            cached_data = self.load_cache(cache_key)
-
-            if cached_data:
-                cves = cached_data.get('vulnerabilities', [])
-                print(f"  Loaded {len(cves)} CVEs from cache (index: {start_index})")
-            else:
-                # Apply rate limiting
-                self._enforce_rate_limit()
-
-                # Fetch from NVD API with 120-day window
-                try:
-                    params = {
-                        'keywordSearch': keyword,
-                        'resultsPerPage': min(self.RESULTS_PER_PAGE, max_samples - len(samples)),
-                        'startIndex': start_index,
-                        'pubStartDate': start_date.strftime('%Y-%m-%dT00:00:00.000'),
-                        'pubEndDate': end_date.strftime('%Y-%m-%dT23:59:59.999')
-                    }
-
-                    response = self.session.get(self.NVD_API_BASE, params=params, timeout=30)
-                    response.raise_for_status()
-
-                    data = response.json()
-                    cves = data.get('vulnerabilities', [])
-
-                    # Cache the response
-                    self.save_cache(cache_key, data)
-
-                    print(f"  Fetched {len(cves)} CVEs from API (index: {start_index})")
-
-                except Exception as e:
-                    self.log_error(f"Failed to fetch CVEs for keyword '{keyword}'",
-                                 {'error': str(e), 'start_index': start_index})
-                    break
-
-            if not cves:
+        while len(samples) < remaining:
+            page = self._fetch_cve_page(keyword, window, start_index, remaining - len(samples))
+            if not page:
                 break
 
-            # Extract data from each CVE
-            for cve_item in cves:
-                if len(samples) >= max_samples:
+            for cve_item in page:
+                if len(samples) >= remaining:
                     break
+                sample = self.extract_cve_data(cve_item, window)
+                if sample:
+                    samples.append(sample)
+                    self.samples_collected += 1
 
-                try:
-                    cve_data = self.extract_cve_data(cve_item)
-                    if cve_data:
-                        samples.append(cve_data)
-                        self.samples_collected += 1
-                except Exception as e:
-                    cve_id = cve_item.get('cve', {}).get('id', 'unknown')
-                    self.log_error(f"Failed to extract data for CVE {cve_id}",
-                                 {'error': str(e)})
-
-            start_index += len(cves)
-
-            # Break if we got fewer results than requested (end of results)
-            if len(cves) < self.RESULTS_PER_PAGE:
+            if len(page) < self.RESULTS_PER_PAGE:
                 break
+
+            start_index += len(page)
 
         return samples
 
-    def extract_cve_data(self, cve_item: Dict) -> Optional[Dict]:
+    # ------------------------------------------------------------------ #
+    # API interactions
+    # ------------------------------------------------------------------ #
+
+    def _fetch_cve_page(
+        self,
+        keyword: str,
+        window: DateWindow,
+        start_index: int,
+        limit: int,
+    ) -> List[Dict]:
+        """Fetch a page of CVEs from the NVD API."""
+        cache_key = self.make_cache_key(
+            "nvd",
+            keyword,
+            window.label(),
+            start_index,
+            limit,
+        )
+
+        cached = self.load_cache(cache_key)
+        if cached:
+            print(f"     Cache hit for keyword '{keyword}' at index {start_index}")
+            return cached.get("vulnerabilities", [])
+
+        params = {
+            "keywordSearch": keyword,
+            "resultsPerPage": min(self.RESULTS_PER_PAGE, limit),
+            "startIndex": start_index,
+            "pubStartDate": window.to_api_params()[0],
+            "pubEndDate": window.to_api_params()[1],
+        }
+
+        self._enforce_rate_limit("nvd")
+
+        try:
+            response = self.session.get(self.NVD_API_BASE, params=params, timeout=45)
+            response.raise_for_status()
+            data = response.json()
+            self.save_cache(cache_key, data)
+            vulnerabilities = data.get("vulnerabilities", [])
+            print(
+                f"     Pulled {len(vulnerabilities)} CVEs "
+                f"(keyword='{keyword}', index={start_index})"
+            )
+            return vulnerabilities
+        except Exception as exc:  # pragma: no cover - network failures
+            self.log_error(
+                f"Failed to fetch CVEs for keyword '{keyword}'",
+                {
+                    "error": str(exc),
+                    "keyword": keyword,
+                    "start_index": start_index,
+                    "window": window.label(),
+                },
+            )
+            return []
+
+    # ------------------------------------------------------------------ #
+    # CVE parsing & GitHub enrichment
+    # ------------------------------------------------------------------ #
+
+    def extract_cve_data(self, cve_item: Dict, window: DateWindow) -> Optional[Dict]:
         """
         Parse CVE record and extract relevant data.
 
         Args:
             cve_item: CVE item from NVD API response
+            window: Date window metadata (for tracing)
 
         Returns:
             Extracted CVE data or None if extraction fails
@@ -301,15 +404,16 @@ class CVECollectorEnhanced(BaseCollector):
             for ref in github_refs:
                 try:
                     vuln, fixed, source = self.fetch_code_from_github(ref)
-                    if vuln and fixed:
-                        if self.validate_code(vuln) and self.validate_code(fixed):
-                            vulnerable_code = vuln
-                            fixed_code = fixed
-                            code_source = source
-                            break
+                    if vuln and fixed and self.validate_code(vuln) and self.validate_code(fixed):
+                        vulnerable_code = vuln
+                        fixed_code = fixed
+                        code_source = source
+                        break
                 except Exception as e:
-                    self.log_error(f"Failed to fetch code from GitHub for {cve_id}",
-                                 {'error': str(e), 'ref': ref})
+                    self.log_error(
+                        f"Failed to fetch code from GitHub for {cve_id}",
+                        {"error": str(e), "ref": ref},
+                    )
 
             return {
                 'cve_id': cve_id,
@@ -322,6 +426,7 @@ class CVECollectorEnhanced(BaseCollector):
                 'cwes': cwes,
                 'published_date': published_date,
                 'source': code_source or 'nvd',
+                'collection_window': window.label(),
                 'collected_at': datetime.now().isoformat()
             }
 
@@ -374,20 +479,17 @@ class CVECollectorEnhanced(BaseCollector):
 
         owner, repo, commit_hash = match.groups()
 
-        # Check cache
         cache_key = self.make_cache_key('github', owner, repo, commit_hash)
         cached_data = self.load_cache(cache_key)
 
         if cached_data:
             return (cached_data.get('vulnerable_code'),
-                   cached_data.get('fixed_code'),
-                   cached_data.get('source'))
+                    cached_data.get('fixed_code'),
+                    cached_data.get('source'))
 
-        # Apply rate limiting for GitHub
-        self._enforce_rate_limit()
+        self._enforce_rate_limit("github")
 
         try:
-            # Fetch commit data from GitHub API
             api_url = f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/commits/{commit_hash}"
             response = self.session.get(api_url, timeout=30)
             response.raise_for_status()
@@ -421,7 +523,6 @@ class CVECollectorEnhanced(BaseCollector):
 
             source = f"github:{owner}/{repo}:{commit_hash}"
 
-            # Cache the result
             self.save_cache(cache_key, {
                 'vulnerable_code': vulnerable_code,
                 'fixed_code': fixed_code,
@@ -432,16 +533,12 @@ class CVECollectorEnhanced(BaseCollector):
 
         except Exception as e:
             self.log_error(f"Failed to fetch GitHub commit",
-                         {'error': str(e), 'url': github_url})
+                           {'error': str(e), 'url': github_url})
             return None, None, None
 
     def _is_code_file(self, filename: str) -> bool:
         """Check if file is a code file based on extension."""
-        code_extensions = {
-            '.py', '.js', '.java', '.c', '.cpp', '.cs', '.rb', '.php',
-            '.go', '.rs', '.swift', '.kt', '.scala', '.ts', '.jsx', '.tsx'
-        }
-        return any(filename.endswith(ext) for ext in code_extensions)
+        return any(filename.endswith(ext) for ext in self.CODE_EXTENSIONS)
 
     def _extract_code_from_patch(self, patch: str) -> Tuple[Optional[str], Optional[str]]:
         """
@@ -481,58 +578,134 @@ class CVECollectorEnhanced(BaseCollector):
 
         return None, None
 
-    def _enforce_rate_limit(self):
-        """
-        Enforce rate limiting (5 requests per 30 seconds).
-        """
-        current_time = time.time()
+    # ------------------------------------------------------------------ #
+    # Rate limiting helpers
+    # ------------------------------------------------------------------ #
 
-        # Remove timestamps older than the rate limit window
-        self.last_request_times = [
-            t for t in self.last_request_times
-            if current_time - t < self.RATE_LIMIT_WINDOW
-        ]
+    def _enforce_rate_limit(self, namespace: str):
+        """Throttle outgoing requests to respect API limits."""
+        if namespace == "nvd":
+            limit, window = self.NVD_RATE
+        elif namespace == "github":
+            limit, window = (
+                self.GITHUB_RATE_AUTH if self.github_token else self.GITHUB_RATE_NOAUTH
+            )
+        else:
+            raise ValueError(f"Unknown rate limit namespace: {namespace}")
 
-        # If we've hit the limit, wait
-        if len(self.last_request_times) >= self.RATE_LIMIT_REQUESTS:
-            oldest_request = self.last_request_times[0]
-            wait_time = self.RATE_LIMIT_WINDOW - (current_time - oldest_request)
+        history = self.request_history[namespace]
+        now = time.time()
 
+        while history and now - history[0] > window:
+            history.popleft()
+
+        if len(history) >= limit:
+            wait_time = window - (now - history[0])
             if wait_time > 0:
-                print(f"  Rate limit reached, waiting {wait_time:.1f}s...")
+                print(
+                    f"     Rate limit reached for {namespace} API, "
+                    f"sleeping {wait_time:.2f}s"
+                )
                 time.sleep(wait_time)
-                current_time = time.time()
+                now = time.time()
+                while history and now - history[0] > window:
+                    history.popleft()
 
-        # Record this request
-        self.last_request_times.append(current_time)
+        history.append(time.time())
+
+    # ------------------------------------------------------------------ #
+    # Utilities
+    # ------------------------------------------------------------------ #
+
+    def _generate_date_windows(self) -> List[DateWindow]:
+        """Generate inclusive date windows that satisfy the NVD limitation."""
+        windows: List[DateWindow] = []
+        start = datetime(self.start_year, 1, 1)
+        final = datetime(self.end_year, 12, 31)
+
+        current = start
+        while current <= final:
+            window_end = min(current + timedelta(days=self.WINDOW_DAYS - 1), final)
+            windows.append(DateWindow(start=current, end=window_end))
+            current = window_end + timedelta(days=1)
+
+        return windows
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="StreamGuard Enhanced CVE Collector")
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=str(Path("data/raw/cves").resolve()),
+        help="Directory to store collected CVE data (default: data/raw/cves)",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable request caching",
+    )
+    parser.add_argument(
+        "--github-token",
+        type=str,
+        default=None,
+        help="GitHub token for higher rate limits",
+    )
+    parser.add_argument(
+        "--start-year",
+        type=int,
+        default=CVECollectorEnhanced.START_YEAR,
+        help="Earliest CVE publication year to include",
+    )
+    parser.add_argument(
+        "--end-year",
+        type=int,
+        default=CVECollectorEnhanced.END_YEAR,
+        help="Latest CVE publication year to include",
+    )
+    parser.add_argument(
+        "--target-samples",
+        type=int,
+        default=CVECollectorEnhanced.TARGET_SAMPLES,
+        help="Total number of CVE samples to collect",
+    )
+    parser.add_argument(
+        "--keywords-file",
+        type=str,
+        default=None,
+        help="Optional file with newline-separated keywords to override defaults",
+    )
+    return parser.parse_args()
+
+
+def load_keywords_from_file(path: Optional[str]) -> Optional[List[str]]:
+    if not path:
+        return None
+    keyword_path = Path(path)
+    if not keyword_path.exists():
+        raise FileNotFoundError(f"Keyword file not found: {keyword_path}")
+    with open(keyword_path, "r", encoding="utf-8") as handle:
+        keywords = [line.strip() for line in handle if line.strip()]
+    return keywords or None
 
 
 def main():
-    """Main entry point for CVE collection."""
-    import argparse
-
-    parser = argparse.ArgumentParser(description='Enhanced CVE Collector for StreamGuard')
-    parser.add_argument('--output-dir', type=str,
-                       default='C:\\Users\\Vimal Sajan\\streamguard\\data\\raw\\cves',
-                       help='Output directory for collected data')
-    parser.add_argument('--no-cache', action='store_true',
-                       help='Disable caching')
-    parser.add_argument('--github-token', type=str,
-                       help='GitHub API token for higher rate limits')
-
-    args = parser.parse_args()
+    args = parse_args()
+    keywords_override = load_keywords_from_file(args.keywords_file)
 
     collector = CVECollectorEnhanced(
         output_dir=args.output_dir,
         cache_enabled=not args.no_cache,
-        github_token=args.github_token
+        github_token=args.github_token,
+        start_year=args.start_year,
+        end_year=args.end_year,
+        target_samples=args.target_samples,
+        keywords=keywords_override,
     )
 
     samples = collector.collect()
-
-    print(f"\nCollection complete! Collected {len(samples)} CVE samples.")
-    print(f"Data saved to: {args.output_dir}\\cve_data.jsonl")
+    print(f"\nCollected {len(samples)} CVE samples. Data saved to {args.output_dir}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -14,7 +14,65 @@ from pathlib import Path
 import numpy as np
 import sys
 
-# Add parent directory to path for imports
+# Add parent directory to path for======================================================================
+LR FINDER SAFETY VALIDATION TEST
+======================================================================
+Testing LR Finder with safety validation on 64 samples
+Duration: ~2-3 minutes
+======================================================================
+/usr/local/lib/python3.12/dist-packages/transformers/utils/generic.py:441: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  _torch_pytree._register_pytree_node(
+[!] boto3 not available. S3 checkpointing disabled.
+[+] Random seed set to 42
+[+] Using device: cuda
+[+] Experiment config saved: models/transformer/exp_config.json
+[*] Loading tokenizer: microsoft/codebert-base
+[*] Loading dataset from data/processed/codexglue/train.jsonl
+[+] Loaded 21854 samples
+    Vulnerable: 10018 (45.8%)
+    Safe: 11836 (54.2%)
+[*] Loading dataset from data/processed/codexglue/valid.jsonl
+[+] Loaded 2732 samples
+    Vulnerable: 1187 (43.4%)
+    Safe: 1545 (56.6%)
+[*] Quick test mode: using 500 train, 100 val samples
+
+[*] Calculating class weights for balanced training...
+[*] Quick test mode: class weights (1.0 vs 1.6593)
+    Base inverse-freq=1.1062, multiplier=1.5
+    Class distribution: Safe=274, Vulnerable=226
+    Class weights: Safe=1.0000, Vulnerable=1.6593
+
+[*] Quick test mode: dropout set to 0.0 (disabled)
+[*] Initializing model: microsoft/codebert-base
+/usr/local/lib/python3.12/dist-packages/transformers/utils/generic.py:309: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  _torch_pytree._register_pytree_node(
+/usr/local/lib/python3.12/dist-packages/transformers/utils/generic.py:309: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  _torch_pytree._register_pytree_node(
+[*] Quick test mode: using default LR=1.50e-05
+[*] Final LR: 1.50e-05
+[*] Discriminative LR:
+    Encoder (76 params): LR=1.50e-06, WD=0.01
+    Head (2 params): LR=1.50e-05, WD=0.01
+    No-decay (125 params): LR=1.50e-05, WD=0.0
+    Total trainable params: 203
+[*] Scheduler config:
+    Total steps: 160
+    Warmup steps: 16 (10.0%)
+    Warmup ratio: 0.1
+[+] Loss: CrossEntropyLoss with class_weights and label_smoothing=0.0
+[+] Mixed precision training disabled
+
+======================================================================
+RUNNING LR FINDER
+======================================================================
+Traceback (most recent call last):
+  File "/content/streamguard/training/train_transformer.py", line 1478, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/content/streamguard/training/train_transformer.py", line 1100, in main
+    from training.utils.lr_finder import LRFinder, analyze_lr_loss_curve, validate_and_cap_lr
+ModuleNotFoundError: No module named 'training' imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from training.utils.lr_cache import (

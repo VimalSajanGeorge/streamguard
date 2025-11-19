@@ -33,7 +33,7 @@ This document outlines deferred features for GNN training that were identified d
 ```python
 # Separate encoder and head parameters
 encoder_params = []  # GCN layers
-head_params = []      # Classifier
+head_params = []      # Classifi
 no_decay_params = []  # Bias, LayerNorm
 
 for name, param in model.named_parameters():
