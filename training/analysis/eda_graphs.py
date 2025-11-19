@@ -28,15 +28,21 @@ except Exception as exc:
         "Install it to match your Torch/CUDA: https://pytorch-geometric.readthedocs.io/"
     ) from exc
 
+try:
+    from training.utils.safe_torch import safe_torch_load
+except ImportError:
+    safe_torch_load = None
+
 
 def load_pt_graphs(dir_path: Path, max_files: int | None = None) -> list[Data]:
     graphs: list[Data] = []
     files = sorted([p for p in dir_path.glob('*.pt')])
     if max_files:
         files = files[:max_files]
+    loader = safe_torch_load if callable(safe_torch_load) else torch.load
     for p in files:
         try:
-            g = torch.load(p)
+            g = loader(p)
             if isinstance(g, Data):
                 graphs.append(g)
         except Exception:
@@ -147,4 +153,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

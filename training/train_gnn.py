@@ -59,6 +59,16 @@ except ImportError:
         LR_FINDER_AVAILABLE = False
         print("[!] LR Finder utilities not available.")
 
+# Safe torch.load helper (PyTorch >=2.6 compatibility)
+try:
+    from training.utils.safe_torch import safe_torch_load
+except ImportError:
+    try:
+        from utils.safe_torch import safe_torch_load
+    except ImportError:
+        safe_torch_load = None
+        print("[!] safe_torch_load helper unavailable; torch.load compatibility may fail.")
+
 # Optional: Focal Loss
 try:
     from training.losses.focal_loss import FocalLoss
@@ -178,13 +188,14 @@ class GraphDataset(Dataset):
             print(f"    Detected precomputed node features (dim={self.precomputed_feature_dim})")
 
     def _load_from_directory(self, data_dir: Path) -> None:
+        loader = safe_torch_load if callable(safe_torch_load) else torch.load
         pt_files = sorted(data_dir.glob('*.pt'))
         jsonl_files = sorted(data_dir.glob('*.jsonl'))
 
         if pt_files:
             for pt_file in pt_files:
                 try:
-                    data = torch.load(pt_file)
+                    data = loader(pt_file)
                     if not isinstance(data, Data):
                         continue
                     if self.use_weights and not hasattr(data, 'weight'):
