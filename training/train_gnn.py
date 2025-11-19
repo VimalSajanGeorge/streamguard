@@ -961,42 +961,73 @@ def main():
         )
         print(f"[+] Weighted sampler created (resamples minority class)")
 
-    # Data loaders
+    # Data loaders with automatic multiprocessing fallback (Cloud TPU/Colab safety)
     pin_memory = torch.cuda.is_available()
+    loader_config = {
+        'num_workers': max(0, args.num_workers),
+        'persistent_workers': args.persistent_workers if args.num_workers > 0 else False,
+        'prefetch_factor': args.prefetch_factor if args.num_workers > 0 else None
+    }
+
     def _loader_kwargs(drop_last: bool) -> Dict[str, Any]:
         kw: Dict[str, Any] = {
             'batch_size': args.batch_size,
-            'num_workers': args.num_workers,
+            'num_workers': loader_config['num_workers'],
             'pin_memory': pin_memory,
             'drop_last': drop_last
         }
-        if args.num_workers > 0:
-            kw['prefetch_factor'] = args.prefetch_factor
-            kw['persistent_workers'] = args.persistent_workers
+        if loader_config['num_workers'] > 0:
+            if loader_config['prefetch_factor'] is not None:
+                kw['prefetch_factor'] = loader_config['prefetch_factor']
+            kw['persistent_workers'] = loader_config['persistent_workers']
         return kw
 
-    if sampler is not None:
-        # PyG DataLoader with sampler (shuffle MUST be False)
-        sampler_kwargs = _loader_kwargs(drop_last=args.drop_last)
-        train_loader = DataLoader(
-            train_dataset,
-            sampler=sampler,
-            shuffle=False,  # Required when using sampler
-            **sampler_kwargs
-        )
-        print(f"[+] Train loader: using weighted sampler (shuffle=False)")
-    else:
+    train_loader: DataLoader
+    val_loader: DataLoader
+
+    def _build_train_loader() -> DataLoader:
+        if sampler is not None:
+            sampler_kwargs = _loader_kwargs(drop_last=args.drop_last)
+            return DataLoader(
+                train_dataset,
+                sampler=sampler,
+                shuffle=False,
+                **sampler_kwargs
+            )
         shuffle_kwargs = _loader_kwargs(drop_last=args.drop_last)
-        train_loader = DataLoader(
+        return DataLoader(
             train_dataset,
             shuffle=True,
             **shuffle_kwargs
         )
+
+    def _build_eval_loader(dataset: GraphDataset) -> DataLoader:
+        eval_kwargs = _loader_kwargs(drop_last=False)
+        eval_kwargs.pop('drop_last', None)
+        return DataLoader(dataset, shuffle=False, **eval_kwargs)
+
+    def _rebuild_loaders() -> None:
+        nonlocal train_loader, val_loader
+        train_loader = _build_train_loader()
+        val_loader = _build_eval_loader(val_dataset)
+
+    _rebuild_loaders()
+    if sampler is not None:
+        print(f"[+] Train loader: using weighted sampler (shuffle=False)")
+    else:
         print(f"[+] Train loader: random shuffle (no sampler)")
 
-    val_kwargs = _loader_kwargs(drop_last=False)
-    val_kwargs.pop('drop_last', None)
-    val_loader = DataLoader(val_dataset, shuffle=False, **val_kwargs)
+    def _handle_worker_unavailable(exc: Exception) -> bool:
+        """Fallback to num_workers=0 when semaphores are unavailable."""
+        nonlocal loader_config
+        if loader_config['num_workers'] == 0:
+            return False
+        print(f"[!] DataLoader workers unavailable ({exc}). Switching to num_workers=0 (no multiprocessing).")
+        loader_config['num_workers'] = 0
+        loader_config['persistent_workers'] = False
+        loader_config['prefetch_factor'] = None
+        _rebuild_loaders()
+        return True
 
     # Model
     # Determine node feature mode
@@ -1263,19 +1294,43 @@ def main():
         else:
             amp_dtype = torch.float16
 
+    def _train_epoch_with_retry() -> float:
+        while True:
+            try:
+                return train_epoch(
+                    model, train_loader, optimizer, criterion, device,
+                    scaler=scaler, grad_clip_norm=args.grad_clip_norm, amp_dtype=amp_dtype,
+                    scheduler=scheduler if isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR) else None
+                )
+            except PermissionError as exc:
+                if not _handle_worker_unavailable(exc):
+                    raise
+
+    def _val_eval_with_retry() -> Dict[str, float]:
+        while True:
+            try:
+                return evaluate(model, val_loader, device, criterion)
+            except PermissionError as exc:
+                if not _handle_worker_unavailable(exc):
+                    raise
+
+    def _collect_val_outputs_with_retry() -> Dict[str, List[float]]:
+        while True:
+            try:
+                return collect_validation_outputs(model, val_loader, device)
+            except PermissionError as exc:
+                if not _handle_worker_unavailable(exc):
+                    raise
+
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
         print("-" * 70)
 
         # Train
-        train_loss = train_epoch(
-            model, train_loader, optimizer, criterion, device,
-            scaler=scaler, grad_clip_norm=args.grad_clip_norm, amp_dtype=amp_dtype,
-            scheduler=scheduler if isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR) else None
-        )
+        train_loss = _train_epoch_with_retry()
 
         # Evaluate
-        val_metrics = evaluate(model, val_loader, device, criterion)
+        val_metrics = _val_eval_with_retry()
 
         # Extract prediction distribution
         dist = val_metrics.get('prediction_distribution', {})
@@ -1417,7 +1472,7 @@ def main():
     if best_checkpoint:
         model.load_state_dict(best_checkpoint['model_state_dict'])
 
-    val_outputs = collect_validation_outputs(model, val_loader, device)
+    val_outputs = _collect_val_outputs_with_retry()
     if args.dump_val_logits:
         dump_validation_logits(args.output_dir, val_outputs)
     default_threshold = 0.5
@@ -1456,14 +1511,24 @@ def main():
         print("="*70)
 
         test_dataset = GraphDataset(args.test_data, use_weights=False)
-        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+        test_loader = _build_eval_loader(test_dataset)
 
         # Load best model
         best_checkpoint = checkpoint_mgr.load_checkpoint('best_model.pt')
         if best_checkpoint:
             model.load_state_dict(best_checkpoint['model_state_dict'])
 
-        test_metrics = evaluate(model, test_loader, device, criterion)
+        def _test_eval_with_retry() -> Dict[str, float]:
+            nonlocal test_loader
+            while True:
+                try:
+                    return evaluate(model, test_loader, device, criterion)
+                except PermissionError as exc:
+                    if not _handle_worker_unavailable(exc):
+                        raise
+                    test_loader = _build_eval_loader(test_dataset)
+
+        test_metrics = _test_eval_with_retry()
 
         print(f"Test Accuracy: {test_metrics['accuracy']:.4f}")
         print(f"Test Precision: {test_metrics['precision']:.4f}")
