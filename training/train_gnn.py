@@ -101,6 +101,24 @@ def set_seed(seed: int):
     print(f"[+] Random seed set to {seed}")
 
 
+def resolve_amp_dtype(args: argparse.Namespace) -> Optional[torch.dtype]:
+    """Determine AMP dtype once per run (handles warnings)."""
+    if not args.mixed_precision:
+        return None
+    if not torch.cuda.is_available():
+        print("[!] Mixed precision requested but CUDA is unavailable; using FP32 training")
+        return None
+    if args.amp_dtype == 'bf16':
+        try:
+            major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+            if major >= 8:
+                return torch.bfloat16
+            print('[!] bf16 requested but GPU does not support it; falling back to fp16')
+        except Exception:
+            print('[!] Could not query GPU capability for bf16; falling back to fp16')
+    return torch.float16
+
+
 def get_git_commit() -> str:
     """Get current git commit hash."""
     try:
@@ -333,6 +351,93 @@ def recommend_batch_size(
     print(f"    Recommended batch size: {recommended}")
 
     return recommended
+
+
+def run_gnn_lr_finder(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    device: torch.device,
+    dataloader: DataLoader,
+    start_lr: float,
+    end_lr: float,
+    num_iter: int,
+    smooth_f: float = 0.05,
+    diverge_th: float = 5.0,
+    amp_dtype: Optional[torch.dtype] = None
+) -> Tuple[List[float], List[float]]:
+    """LR finder adapted for PyG batches."""
+    if num_iter <= 0:
+        raise ValueError("num_iter must be positive for LR Finder")
+
+    dataset_len = len(getattr(dataloader, 'dataset', dataloader))
+    if dataset_len == 0:
+        raise RuntimeError("LR Finder dataset is empty")
+
+    model.train()
+    lr_history: List[float] = []
+    loss_history: List[float] = []
+    best_loss = float('inf')
+    smoothed_loss = 0.0
+    lr = start_lr
+    lr_mult = (end_lr / max(start_lr, 1e-12)) ** (1 / max(1, num_iter - 1))
+    scaler = GradScaler() if amp_dtype is not None and device.type == 'cuda' else None
+
+    data_iter = iter(dataloader)
+
+    for iteration in range(num_iter):
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(dataloader)
+            batch = next(data_iter)
+
+        batch = batch.to(device)
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+        optimizer.zero_grad()
+        if scaler is not None:
+            with autocast(device_type='cuda', dtype=amp_dtype):
+                logits = model(batch)
+                loss = criterion(logits, batch.y)
+                if hasattr(batch, 'weight'):
+                    weights = batch.weight.to(device)
+                    loss = (loss * weights).mean()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits = model(batch)
+            loss = criterion(logits, batch.y)
+            if hasattr(batch, 'weight'):
+                weights = batch.weight.to(device)
+                loss = (loss * weights).mean()
+            loss.backward()
+            optimizer.step()
+
+        loss_value = float(loss.detach().item())
+        if iteration == 0:
+            smoothed_loss = loss_value
+        else:
+            smoothed_loss = smooth_f * loss_value + (1 - smooth_f) * smoothed_loss
+
+        lr_history.append(lr)
+        loss_history.append(smoothed_loss)
+
+        if smoothed_loss < best_loss:
+            best_loss = smoothed_loss
+        if smoothed_loss > diverge_th * max(best_loss, 1e-12):
+            print(f"[!] Loss diverged at LR={lr:.2e}, stopping early")
+            break
+
+        if (iteration + 1) % 10 == 0:
+            print(f"    Iter {iteration + 1}/{num_iter}: LR={lr:.2e}, Loss={smoothed_loss:.4f}")
+
+        lr *= lr_mult
+
+    return lr_history, loss_history
 
 
 class EnhancedTaintFlowGNN(nn.Module):
@@ -891,6 +996,8 @@ def main():
         train_dataset.graphs = train_dataset.graphs[:100]
         val_dataset.graphs = val_dataset.graphs[:50]
 
+    amp_dtype = resolve_amp_dtype(args)
+
     # Auto batch size
     if args.auto_batch_size:
         args.batch_size = recommend_batch_size(train_dataset, hidden_dim=args.hidden_dim)
@@ -1144,23 +1251,29 @@ def main():
             if args.lr_finder_subsample:
                 print(f"[*] Using subsample: {args.lr_finder_subsample} graphs (faster LR Finder)")
                 subsample_indices = list(range(min(args.lr_finder_subsample, len(train_dataset))))
-                subsample_graphs = [train_dataset.graphs[i] for i in subsample_indices]
-                from torch_geometric.data import InMemoryDataset
-                # Create temporary dataset
-                class TempDataset(Dataset):
-                    def __init__(self, graphs):
-                        self.graphs = graphs
-                    def __len__(self):
-                        return len(self.graphs)
-                    def __getitem__(self, idx):
-                        return self.graphs[idx]
-                finder_dataset = TempDataset(subsample_graphs)
-                finder_loader = DataLoader(finder_dataset, batch_size=args.batch_size, shuffle=True)
+                subset_graphs = [train_dataset.graphs[i] for i in subsample_indices]
             else:
-                finder_loader = train_loader
-                if args.lr_finder_subsample is None and len(train_dataset) > 1000:
+                subset_graphs = train_dataset.graphs
+                if len(train_dataset) > 1000:
                     print(f"[!] WARNING: Running LR Finder on large dataset ({len(train_dataset)} graphs)")
                     print(f"    Consider using --lr-finder-subsample 256 for faster results")
+
+            class _TempGraphDataset(Dataset):
+                def __init__(self, graphs: List[Data]):
+                    self.graphs = graphs
+                def __len__(self) -> int:
+                    return len(self.graphs)
+                def __getitem__(self, idx: int) -> Data:
+                    return self.graphs[idx]
+
+            finder_dataset = _TempGraphDataset(subset_graphs)
+            finder_loader = DataLoader(
+                finder_dataset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=0,
+                pin_memory=torch.cuda.is_available()
+            )
 
             # Create fresh model and optimizer for LR Finder
             finder_model = EnhancedTaintFlowGNN(
@@ -1168,7 +1281,8 @@ def main():
                 embedding_dim=args.embedding_dim,
                 hidden_dim=args.hidden_dim,
                 num_layers=args.num_layers,
-                dropout=args.dropout
+                dropout=args.dropout,
+                precomputed_feature_dim=precomputed_dim
             ).to(device)
 
             finder_optimizer = torch.optim.Adam(
@@ -1177,14 +1291,17 @@ def main():
                 weight_decay=args.weight_decay
             )
 
-            # Run LR Finder (PyG adapted)
-            lr_finder = LRFinder(finder_model, finder_optimizer, criterion, device=device)
-            lr_history, loss_history = lr_finder.range_test(
+            use_amp_dtype = amp_dtype if amp_dtype is not None else None
+            lr_history, loss_history = run_gnn_lr_finder(
+                finder_model,
+                finder_optimizer,
+                criterion,
+                device,
                 finder_loader,
                 start_lr=args.lr_range_start,
                 end_lr=args.lr_range_end,
                 num_iter=args.lr_finder_max_iter,
-                step_mode='exp'
+                amp_dtype=use_amp_dtype
             )
 
             print(f"[+] LR Finder complete. Tested {len(lr_history)} learning rates")
@@ -1279,20 +1396,7 @@ def main():
     print(f"[+] CSV metrics will be saved to: {csv_path}")
 
     # AMP scaler/dtype
-    scaler = None
-    amp_dtype = None
-    if args.mixed_precision and torch.cuda.is_available():
-        scaler = GradScaler()
-        if args.amp_dtype == 'bf16':
-            try:
-                major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
-                amp_dtype = torch.bfloat16 if major >= 8 else torch.float16
-                if major < 8:
-                    print('[!] bf16 requested but not supported; falling back to fp16')
-            except Exception:
-                amp_dtype = torch.float16
-        else:
-            amp_dtype = torch.float16
+    scaler = GradScaler() if amp_dtype is not None and device.type == 'cuda' else None
 
     def _train_epoch_with_retry() -> float:
         while True:

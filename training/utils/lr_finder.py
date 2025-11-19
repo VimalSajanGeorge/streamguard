@@ -453,6 +453,7 @@ def validate_and_cap_lr(
 
     return {
         "lr": float(final_lr),
+        "final_lr": float(final_lr),
         "used_fallback": used_fallback,
         "note": note
     }

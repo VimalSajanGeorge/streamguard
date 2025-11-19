@@ -56,7 +56,9 @@ def stats_from_graphs(graphs: list[Data]) -> Dict[str, Any]:
         return {
             'num_graphs': 0,
             'label_fraction': {'safe_0': 0.0, 'vuln_1': 0.0},
-            'nodes': {}, 'edges': {},
+            'nodes': {},
+            'edges_raw': {},
+            'edges_undirected': {},
             'empty_edges': 0, 'tiny_nodes': 0, 'huge_nodes': 0,
         }
     labels = np.array([int(getattr(g.y, 'item')() if hasattr(g.y, 'item') else int(g.y)) for g in graphs], dtype=int)

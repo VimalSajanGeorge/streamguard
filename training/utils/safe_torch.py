@@ -28,6 +28,7 @@ __all__ = ["safe_torch_load", "register_safe_graph_globals"]
 
 _HAS_WEIGHTS_ONLY = "weights_only" in inspect.signature(torch.load).parameters
 _SAFE_GLOBALS_REGISTERED = False
+_FALLBACK_WARNED = False
 
 
 def register_safe_graph_globals() -> bool:
@@ -95,6 +96,7 @@ def safe_torch_load(
 
     load_kwargs = _build_loader_kwargs(map_location, weights_only, kwargs)
 
+    global _FALLBACK_WARNED
     try:
         return torch.load(obj, **load_kwargs)
     except pickle.UnpicklingError as exc:
@@ -108,11 +110,12 @@ def safe_torch_load(
         if register_pyg_data:
             register_safe_graph_globals()
 
-        warnings.warn(
-            f"torch.load fallback triggered for '{obj}'. Retrying with "
-            "weights_only=False.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        if not _FALLBACK_WARNED:
+            warnings.warn(
+                f"torch.load fallback triggered for '{obj}'. Retrying with "
+                "weights_only=False (subsequent fallbacks suppressed).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            _FALLBACK_WARNED = True
         return torch.load(obj, **fallback_kwargs)
-
