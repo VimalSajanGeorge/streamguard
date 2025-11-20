@@ -218,7 +218,7 @@ def ecosystem_specific():
                 break
             print("Please select a number between 0 and 4.")
         except ValueError:
-            print("Please enter a valid number.")
+            print("Please enter a valid number.") 
 
     target_samples = int(input("\nNumber of samples (default: 500): ").strip() or "500")
 
