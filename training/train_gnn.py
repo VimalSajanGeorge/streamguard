@@ -69,6 +69,36 @@ except ImportError:
         safe_torch_load = None
         print("[!] safe_torch_load helper unavailable; torch.load compatibility may fail.")
 
+# PyTorch 2.6 checkpoint compatibility helper
+def load_checkpoint_compat(path: Path):
+    """
+    Load a checkpoint in a way that is compatible with PyTorch >= 2.6, where
+    torch.load defaults to weights_only=True.
+
+    Prefer the shared safe_torch_load helper if available. Otherwise, try
+    torch.load(path) and, if that fails due to the weights_only restriction,
+    fall back to torch.load(path, weights_only=False).
+    """
+    # Prefer shared safe_torch_load helper if it is available
+    if callable(safe_torch_load):
+        return safe_torch_load(path)
+
+    # Fallback: try standard torch.load, then retry with weights_only=False
+    try:
+        return torch.load(path)
+    except Exception as exc:
+        # Work around the PyTorch 2.6 "weights_only" default for trusted checkpoints
+        try:
+            print(
+                f"[!] torch.load fallback triggered for checkpoint '{path}'. "
+                "Retrying with weights_only=False (subsequent fallbacks suppressed).",
+                file=sys.stderr,
+            )
+            return torch.load(path, weights_only=False)
+        except TypeError:
+            # Older PyTorch versions may not support the weights_only kwarg; re-raise
+            raise exc
+
 # Optional: Focal Loss
 try:
     from training.losses.focal_loss import FocalLoss
@@ -664,13 +694,13 @@ class S3CheckpointManager:
         local_path = self.local_dir / checkpoint_name
 
         if local_path.exists():
-            return torch.load(local_path)
+            return load_checkpoint_compat(local_path)
 
         if self.s3_client:
             s3_key = f"{self.s3_prefix}/{checkpoint_name}" if self.s3_prefix else checkpoint_name
             try:
                 self.s3_client.download_file(self.s3_bucket, s3_key, str(local_path))
-                return torch.load(local_path)
+                return load_checkpoint_compat(local_path)
             except:
                 pass
 
