@@ -16,12 +16,19 @@ Usage:
 import argparse
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
 from pathlib import Path
 import sys
 
+# Optional seaborn import (graceful fallback for environments without seaborn)
+try:
+    import seaborn as sns  # type: ignore
+except ImportError:
+    sns = None  # type: ignore
+    print("[!] seaborn not available; using matplotlib defaults.")
+
 # Set style
-sns.set_style("whitegrid")
+if sns:
+    sns.set_style("whitegrid")
 plt.rcParams['figure.figsize'] = (12, 8)
 plt.rcParams['font.size'] = 10
 

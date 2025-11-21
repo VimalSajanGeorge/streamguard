@@ -18,7 +18,7 @@ import hashlib
 import subprocess
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING, Callable
 import sys
 
 import numpy as np
@@ -31,13 +31,23 @@ try:
 except (ImportError, AttributeError):
     from torch.cuda.amp import GradScaler, autocast
 
+if TYPE_CHECKING:
+    from torch_geometric.loader import DataLoader as GeoDataLoader
+    from torch_geometric.data import Data as GeoData
+else:
+    GeoData = Any  # type: ignore
+    GeoDataLoader = Any  # type: ignore
+
 try:
     import torch_geometric
-    from torch_geometric.data import Data, DataLoader
+    from torch_geometric.data import Data
+    from torch_geometric.loader import DataLoader
     from torch_geometric.nn import GCNConv, global_mean_pool, global_max_pool
     TORCH_GEOMETRIC_AVAILABLE = True
 except ImportError:
     TORCH_GEOMETRIC_AVAILABLE = False
+    Data = Any  # type: ignore
+    DataLoader = Any  # type: ignore
     print("[!] PyTorch Geometric not available. Install: pip install torch-geometric")
 
 from sklearn.metrics import (
@@ -46,6 +56,10 @@ from sklearn.metrics import (
 )
 
 # Optional: LR Finder and Cache utilities
+if TYPE_CHECKING:
+    from training.utils.lr_finder import LRFinder, analyze_lr_loss_curve, validate_and_cap_lr
+    from training.utils.lr_cache import compute_cache_key, save_lr_cache, load_lr_cache
+
 try:
     from training.utils.lr_finder import LRFinder, analyze_lr_loss_curve, validate_and_cap_lr
     from training.utils.lr_cache import compute_cache_key, save_lr_cache, load_lr_cache
@@ -57,6 +71,9 @@ except ImportError:
         LR_FINDER_AVAILABLE = True
     except ImportError:
         LR_FINDER_AVAILABLE = False
+        compute_cache_key = None  # type: ignore[assignment]
+        save_lr_cache = None  # type: ignore[assignment]
+        load_lr_cache = None  # type: ignore[assignment]
         print("[!] LR Finder utilities not available.")
 
 # Safe torch.load helper (PyTorch >=2.6 compatibility)
@@ -204,7 +221,7 @@ class GraphDataset(Dataset):
         self.use_weights = use_weights
         self.encoder_features = encoder_features
         self.encoder_feature_dim = encoder_feature_dim
-        self.graphs: List[Data] = []
+        self.graphs: List[GeoData] = []
         self.node_counts: List[int] = []
         self.edge_counts: List[int] = []
         self.uses_precomputed_features: bool = False
@@ -306,7 +323,7 @@ class GraphDataset(Dataset):
 
                 self._register_graph(graph_data)
 
-    def _register_graph(self, graph_data: Data) -> None:
+    def _register_graph(self, graph_data: GeoData) -> None:
         self.graphs.append(graph_data)
         if hasattr(graph_data, 'x') and graph_data.x is not None:
             if graph_data.x.ndim == 1:
@@ -388,7 +405,7 @@ def run_gnn_lr_finder(
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
-    dataloader: DataLoader,
+    dataloader: "GeoDataLoader",  # type: ignore[type-arg]
     start_lr: float,
     end_lr: float,
     num_iter: int,
@@ -707,6 +724,10 @@ class S3CheckpointManager:
         return None
 
 
+# Backward compatibility alias for checkpoint manager naming used by tooling/type checkers
+CheckpointManager = S3CheckpointManager
+
+
 def compute_binary_f1(y_true: np.ndarray, y_pred: np.ndarray, positive_class: int = 1) -> float:
     """Compute F1 for vulnerable class."""
     _, _, f1, _ = precision_recall_fscore_support(
@@ -717,7 +738,7 @@ def compute_binary_f1(y_true: np.ndarray, y_pred: np.ndarray, positive_class: in
 
 def evaluate(
     model: nn.Module,
-    dataloader: DataLoader,
+    dataloader: "GeoDataLoader",
     device: torch.device,
     criterion: Optional[nn.Module] = None
 ) -> Dict[str, float]:
@@ -769,7 +790,7 @@ def evaluate(
     }
 
 
-def collect_validation_outputs(model: nn.Module, dataloader: DataLoader, device: torch.device) -> Dict[str, List[float]]:
+def collect_validation_outputs(model: nn.Module, dataloader: "GeoDataLoader", device: torch.device) -> Dict[str, List[float]]:
     """Collect probabilities, predictions and labels for threshold analysis."""
     model.eval()
     probs: List[float] = []
@@ -836,7 +857,7 @@ def compute_balanced_accuracy_from_counts(counts: Dict[str, int]) -> float:
 
 def train_epoch(
     model: nn.Module,
-    dataloader: DataLoader,
+    dataloader: "GeoDataLoader",
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
@@ -854,7 +875,8 @@ def train_epoch(
 
         optimizer.zero_grad()
 
-        if scaler is not None and amp_dtype is not None and device.type == 'cuda':
+        use_amp = scaler is not None and amp_dtype is not None and device.type == 'cuda'
+        if use_amp:
             with autocast(device_type='cuda', dtype=amp_dtype):
                 logits = model(data)
                 loss = criterion(logits, data.y)
@@ -867,17 +889,20 @@ def train_epoch(
             weights = data.weight.to(device)
             loss = (loss * weights).mean()
 
-        loss.backward()
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         # PHASE 1: Gradient clipping (AMP-compatible)
-        if scaler is not None:
+        if use_amp:
             # If AMP is enabled, unscale before clipping
             scaler.unscale_(optimizer)
         
         if grad_clip_norm and grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
 
-        if scaler is not None:
+        if use_amp:
             # If AMP is enabled, use scaler for optimizer step
             scaler.step(optimizer)
             scaler.update()
@@ -1119,10 +1144,10 @@ def main():
             kw['persistent_workers'] = loader_config['persistent_workers']
         return kw
 
-    train_loader: DataLoader
-    val_loader: DataLoader
+    train_loader: "GeoDataLoader"
+    val_loader: "GeoDataLoader"
 
-    def _build_train_loader() -> DataLoader:
+    def _build_train_loader() -> "GeoDataLoader":
         if sampler is not None:
             sampler_kwargs = _loader_kwargs(drop_last=args.drop_last)
             return DataLoader(
@@ -1138,7 +1163,7 @@ def main():
             **shuffle_kwargs
         )
 
-    def _build_eval_loader(dataset: GraphDataset) -> DataLoader:
+    def _build_eval_loader(dataset: GraphDataset) -> "GeoDataLoader":
         eval_kwargs = _loader_kwargs(drop_last=False)
         eval_kwargs.pop('drop_last', None)
         return DataLoader(dataset, shuffle=False, **eval_kwargs)
@@ -1235,6 +1260,11 @@ def main():
     lr_finder_analysis = None  # Store for checkpoint metadata
 
     if args.find_lr and LR_FINDER_AVAILABLE:
+        if not (callable(compute_cache_key) and callable(load_lr_cache)):
+            raise RuntimeError("LR cache utilities are unavailable; ensure training.utils.lr_cache is importable.")
+        assert callable(compute_cache_key)
+        assert callable(load_lr_cache)
+
         print("\n" + "="*70)
         print("RUNNING LR FINDER (GNN)")
         print("="*70)
@@ -1289,11 +1319,11 @@ def main():
                     print(f"    Consider using --lr-finder-subsample 256 for faster results")
 
             class _TempGraphDataset(Dataset):
-                def __init__(self, graphs: List[Data]):
+                def __init__(self, graphs: List[GeoData]):
                     self.graphs = graphs
                 def __len__(self) -> int:
                     return len(self.graphs)
-                def __getitem__(self, idx: int) -> Data:
+                def __getitem__(self, idx: int) -> GeoData:
                     return self.graphs[idx]
 
             finder_dataset = _TempGraphDataset(subset_graphs)
@@ -1362,23 +1392,26 @@ def main():
                 print(f"    Reasons: {reasons}")
 
             # Save to cache
-            save_lr_cache(
-                cache_key,
-                suggested_lr,
-                lr_history={
-                    'min_loss': float(min(loss_history)),
-                    'max_loss': float(max(loss_history)),
-                    'num_points': len(lr_history)
-                },
-                metadata={
-                    'analysis': lr_finder_analysis,
-                    'validation': validation_result,
-                    'timestamp': datetime.now().isoformat(),
-                    'model_hash': model_hash,
-                    'batch_size': args.batch_size
-                }
-            )
-            print(f"[+] LR Finder results cached (key: {cache_key[:12]}...)")
+            if callable(save_lr_cache):
+                save_lr_cache(
+                    cache_key,
+                    suggested_lr,
+                    lr_history={
+                        'min_loss': float(min(loss_history)),
+                        'max_loss': float(max(loss_history)),
+                        'num_points': len(lr_history)
+                    },
+                    metadata={
+                        'analysis': lr_finder_analysis,
+                        'validation': validation_result,
+                        'timestamp': datetime.now().isoformat(),
+                        'model_hash': model_hash,
+                        'batch_size': args.batch_size
+                    }
+                )
+                print(f"[+] LR Finder results cached (key: {cache_key[:12]}...)")
+            else:
+                print("[!] LR cache helper unavailable; skipping LR cache save")
 
         # Apply suggested LR (unless overridden)
         if args.lr_override is not None:

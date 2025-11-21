@@ -63,6 +63,79 @@ except ImportError:
     S3_AVAILABLE = False
     print("[!] boto3 not available. S3 checkpointing disabled.")
 
+# Optional: Focal Loss
+try:
+    from training.losses.focal_loss import FocalLoss
+except ImportError:
+    try:
+        from losses.focal_loss import FocalLoss  # type: ignore
+    except ImportError:
+        FocalLoss = None  # type: ignore
+        print("[!] Focal Loss not available; falling back to CrossEntropyLoss when requested.")
+
+# Optional: LR cache helpers
+try:
+    from training.utils.lr_cache import (
+        compute_cache_key,
+        save_lr_cache,
+        load_lr_cache,
+        invalidate_cache,
+    )
+except ImportError:
+    try:
+        from utils.lr_cache import (  # type: ignore
+            compute_cache_key,
+            save_lr_cache,
+            load_lr_cache,
+            invalidate_cache,
+        )
+    except ImportError:
+        compute_cache_key = None  # type: ignore
+        save_lr_cache = None  # type: ignore
+        load_lr_cache = None  # type: ignore
+        invalidate_cache = None  # type: ignore
+        print("[!] LR cache utilities not available; LR finder caching disabled.")
+
+# Optional: checkpoint manager for S3/local
+try:
+    from training.scripts.collection.checkpoint_manager import CheckpointManager
+except ImportError:
+    try:
+        from scripts.collection.checkpoint_manager import CheckpointManager  # type: ignore
+    except ImportError:
+        CheckpointManager = None  # type: ignore
+        print("[!] CheckpointManager not available; S3/local checkpoint handling may fail.")
+
+# Convenience wrappers for LR cache to satisfy static analysis
+def compute_cache_key_for_lr_finder(train_dataset, args):
+    """
+    Compute a stable cache key for the LR finder based on dataset path,
+    model name, batch size, and max_seq_len.
+    """
+    if compute_cache_key is None:
+        raise ImportError("LR cache helpers are not available")
+    dataset_path = Path(args.train_data) if hasattr(args, "train_data") else Path("")
+    extra = {"max_seq_len": getattr(args, "max_seq_len", None)}
+    return compute_cache_key(dataset_path, args.model_name, args.batch_size, extra)
+
+
+def load_cached_lr(cache_key: str, cache_dir: Path, max_age_hours: int, force_invalidate: bool = False):
+    if invalidate_cache and force_invalidate:
+        invalidate_cache(cache_key)
+    if load_lr_cache is None:
+        return None
+    payload = load_lr_cache(cache_key, max_age_hours=max_age_hours)
+    if not payload:
+        return None
+    return float(payload.get("suggested_lr", 0.0))
+
+
+def save_lr_to_cache(cache_key: str, suggested_lr: float, cache_dir: Path, lr_history: Optional[dict] = None):
+    if save_lr_cache is None:
+        return
+    lr_history = lr_history or {}
+    save_lr_cache(cache_key, suggested_lr, lr_history, metadata={"source": "lr_finder"})
+
 
 def set_seed(seed: int):
     """
@@ -2157,6 +2230,8 @@ def run_production_training(base_args):
             scaler = GradScaler() if args_copy.mixed_precision else None
 
             # Checkpoint manager
+            if CheckpointManager is None:
+                raise ImportError("CheckpointManager not available; ensure training.scripts.collection.checkpoint_manager is importable")
             checkpoint_mgr = CheckpointManager(
                 args_copy.output_dir, s3_bucket=args_copy.s3_bucket,
                 s3_prefix=args_copy.s3_prefix
