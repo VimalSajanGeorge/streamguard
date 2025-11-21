@@ -18,7 +18,7 @@ import hashlib
 import subprocess
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING, Callable
+from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING, Callable, Iterable
 import sys
 
 import numpy as np
@@ -405,7 +405,7 @@ def run_gnn_lr_finder(
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
-    dataloader: "GeoDataLoader",  # type: ignore[type-arg]
+    dataloader: Iterable[Data],
     start_lr: float,
     end_lr: float,
     num_iter: int,
@@ -1068,16 +1068,28 @@ def main():
     # ========================================================================
 
     # Extract graph-level labels
-    train_labels = [g.y.item() for g in train_dataset.graphs]
-    class_counts = torch.bincount(torch.tensor(train_labels))
+    train_labels = [int(g.y.item()) for g in train_dataset.graphs]
+    label_tensor = torch.tensor(train_labels, dtype=torch.long)
+    # Use minlength=2 to ensure we always have both class bins [safe, vulnerable]
+    class_counts = torch.bincount(label_tensor, minlength=2)
 
     print(f"\n[*] Calculating class weights for balanced training...")
     print(f"    Class distribution: Safe={class_counts[0]}, Vulnerable={class_counts[1]}")
 
-    # Calculate inverse-frequency class weights
-    total = len(train_labels)
-    weight_safe = total / (2.0 * class_counts[0])
-    weight_vulnerable = total / (2.0 * class_counts[1])
+    # Guard against missing classes (count == 0) to prevent division by zero
+    if class_counts[0] == 0 or class_counts[1] == 0:
+        print("[!] WARNING: One of the classes is missing in the training split.")
+        print("    Disabling class weighting and weighted sampler to avoid crashes.")
+        print("    Using uniform weights (1.0) for both classes.")
+        args.use_weights = False
+        args.use_weighted_sampler = False
+        weight_safe = 1.0
+        weight_vulnerable = 1.0
+    else:
+        # Calculate inverse-frequency class weights (safe computation)
+        total = len(train_labels)
+        weight_safe = total / (2.0 * class_counts[0].item())
+        weight_vulnerable = total / (2.0 * class_counts[1].item())
 
     # Apply multiplier
     if args.weight_multiplier != 1.0:
@@ -1113,15 +1125,23 @@ def main():
     # Create weighted sampler if requested
     sampler = None
     if args.use_weighted_sampler:
-        print(f"[*] Creating weighted sampler for class balance...")
-        class_weights_sampling = 1.0 / class_counts.float()
-        sample_weights = torch.tensor([class_weights_sampling[label] for label in train_labels])
-        sampler = WeightedRandomSampler(
-            weights=sample_weights,
-            num_samples=len(train_dataset),
-            replacement=True
-        )
-        print(f"[+] Weighted sampler created (resamples minority class)")
+        # Only build sampler if all class counts > 0 (avoid inf weights)
+        if (class_counts == 0).any():
+            print("[!] Skipping weighted sampler because one class has zero count.")
+            sampler = None
+        else:
+            print(f"[*] Creating weighted sampler for class balance...")
+            class_weights_sampling = 1.0 / class_counts.float()
+            sample_weights = torch.tensor(
+                [class_weights_sampling[label] for label in train_labels],
+                dtype=torch.float32
+            )
+            sampler = WeightedRandomSampler(
+                weights=sample_weights,
+                num_samples=len(train_dataset),
+                replacement=True
+            )
+            print(f"[+] Weighted sampler created (resamples minority class)")
 
     # Data loaders with automatic multiprocessing fallback (Cloud TPU/Colab safety)
     pin_memory = torch.cuda.is_available()
