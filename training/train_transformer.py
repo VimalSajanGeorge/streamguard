@@ -20,7 +20,13 @@ import subprocess
 import math
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Callable, cast, Type, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from training.utils.lr_finder import LRFinder as _LRFinder  # type: ignore
+    LRFinderType = Type["_LRFinder"]
+else:
+    LRFinderType = Type[Any]
 import sys
 
 import numpy as np
@@ -63,17 +69,23 @@ except ImportError:
     S3_AVAILABLE = False
     print("[!] boto3 not available. S3 checkpointing disabled.")
 
-# Optional: Focal Loss
+# Optional: Focal Loss (typed for static analysis)
+FocalLoss: Optional[Type[nn.Module]] = None
+FOCAL_LOSS_AVAILABLE = True
 try:
-    from training.losses.focal_loss import FocalLoss
+    from training.losses.focal_loss import FocalLoss as _FocalLoss
+    FocalLoss = _FocalLoss
 except ImportError:
     try:
-        from losses.focal_loss import FocalLoss  # type: ignore
+        from losses.focal_loss import FocalLoss as _FocalLoss  # type: ignore
+        FocalLoss = _FocalLoss
     except ImportError:
-        FocalLoss = None  # type: ignore
+        FocalLoss = None
+        FOCAL_LOSS_AVAILABLE = False
         print("[!] Focal Loss not available; falling back to CrossEntropyLoss when requested.")
 
 # Optional: LR cache helpers
+LRFinder: Optional[Type[Any]] = None
 try:
     from training.utils.lr_cache import (
         compute_cache_key,
@@ -81,6 +93,8 @@ try:
         load_lr_cache,
         invalidate_cache,
     )
+    from training.utils.lr_finder import LRFinder as _LRFinder
+    LRFinder = _LRFinder
 except ImportError:
     try:
         from utils.lr_cache import (  # type: ignore
@@ -89,40 +103,59 @@ except ImportError:
             load_lr_cache,
             invalidate_cache,
         )
+        from utils.lr_finder import LRFinder as _LRFinder  # type: ignore
+        LRFinder = _LRFinder
     except ImportError:
         compute_cache_key = None  # type: ignore
         save_lr_cache = None  # type: ignore
         load_lr_cache = None  # type: ignore
         invalidate_cache = None  # type: ignore
+        LRFinder = None
         print("[!] LR cache utilities not available; LR finder caching disabled.")
 
+# Type hints for optional LR cache helpers (helps static analysis)
+compute_cache_key = cast(Optional[Callable[..., str]], compute_cache_key)  # type: ignore[name-defined]
+save_lr_cache = cast(Optional[Callable[..., None]], save_lr_cache)  # type: ignore[name-defined]
+load_lr_cache = cast(Optional[Callable[..., Dict[str, Any]]], load_lr_cache)  # type: ignore[name-defined]
+invalidate_cache = cast(Optional[Callable[[str], None]], invalidate_cache)  # type: ignore[name-defined]
+LRFinder = cast(Optional[Type[Any]], LRFinder)
+
 # Optional: checkpoint manager for S3/local
+CheckpointManagerType = Optional[Type[Any]]
+CheckpointManager: CheckpointManagerType = None
 try:
-    from training.scripts.collection.checkpoint_manager import CheckpointManager
+    from training.scripts.collection.checkpoint_manager import CheckpointManager as _CheckpointManager
+    CheckpointManager = _CheckpointManager
 except ImportError:
     try:
-        from scripts.collection.checkpoint_manager import CheckpointManager  # type: ignore
+        from scripts.collection.checkpoint_manager import CheckpointManager as _CheckpointManager  # type: ignore
+        CheckpointManager = _CheckpointManager
     except ImportError:
-        CheckpointManager = None  # type: ignore
+        CheckpointManager = None
         print("[!] CheckpointManager not available; S3/local checkpoint handling may fail.")
 
 # Convenience wrappers for LR cache to satisfy static analysis
-def compute_cache_key_for_lr_finder(train_dataset, args):
+def compute_cache_key_for_lr_finder(train_dataset, args) -> str:
     """
     Compute a stable cache key for the LR finder based on dataset path,
     model name, batch size, and max_seq_len.
     """
-    if compute_cache_key is None:
+    if not callable(compute_cache_key):
         raise ImportError("LR cache helpers are not available")
+    cache_fn = cast(Callable[..., str], compute_cache_key)
     dataset_path = Path(args.train_data) if hasattr(args, "train_data") else Path("")
-    extra = {"max_seq_len": getattr(args, "max_seq_len", None)}
-    return compute_cache_key(dataset_path, args.model_name, args.batch_size, extra)
+    extra = {
+        "max_seq_len": getattr(args, "max_seq_len", None),
+        "model_name": getattr(args, "model_name", None),
+        "batch_size": getattr(args, "batch_size", None),
+    }
+    return cache_fn(dataset_path, args.model_name, args.batch_size, extra)
 
 
-def load_cached_lr(cache_key: str, cache_dir: Path, max_age_hours: int, force_invalidate: bool = False):
-    if invalidate_cache and force_invalidate:
+def load_cached_lr(cache_key: str, cache_dir: Path, max_age_hours: int, force_invalidate: bool = False) -> Optional[float]:
+    if callable(invalidate_cache) and force_invalidate:
         invalidate_cache(cache_key)
-    if load_lr_cache is None:
+    if not callable(load_lr_cache):
         return None
     payload = load_lr_cache(cache_key, max_age_hours=max_age_hours)
     if not payload:
@@ -130,8 +163,8 @@ def load_cached_lr(cache_key: str, cache_dir: Path, max_age_hours: int, force_in
     return float(payload.get("suggested_lr", 0.0))
 
 
-def save_lr_to_cache(cache_key: str, suggested_lr: float, cache_dir: Path, lr_history: Optional[dict] = None):
-    if save_lr_cache is None:
+def save_lr_to_cache(cache_key: str, suggested_lr: float, cache_dir: Path, lr_history: Optional[dict] = None) -> None:
+    if not callable(save_lr_cache):
         return
     lr_history = lr_history or {}
     save_lr_cache(cache_key, suggested_lr, lr_history, metadata={"source": "lr_finder"})
@@ -2172,7 +2205,7 @@ def run_production_training(base_args):
             class_weights = train_dataset.get_class_weights(multiplier=args_copy.weight_multiplier)
             class_weights = class_weights.to(device)
 
-            if args_copy.focal_loss:
+            if args_copy.focal_loss and FocalLoss is not None:
                 criterion = FocalLoss(alpha=class_weights, gamma=args_copy.focal_gamma)
             else:
                 criterion = nn.CrossEntropyLoss(weight=class_weights)
@@ -2185,6 +2218,9 @@ def run_production_training(base_args):
             # LR Finder with fallback
             if args_copy.find_lr and args_copy.lr_override is None:
                 try:
+                    if not (callable(compute_cache_key) and callable(load_lr_cache)):
+                        raise RuntimeError("LR cache utilities unavailable; skipping LR Finder.")
+
                     cache_key = compute_cache_key_for_lr_finder(train_dataset, args_copy)
                     cached_lr = load_cached_lr(
                         cache_key, cache_dir=Path('models/transformer/.lr_cache'),
