@@ -1,0 +1,23 @@
+{
+  "config_B_f1": 0.0,
+  "config_C_f1": 0.0,
+  "config_D_f1": 0.0,
+  "cfa_delta": 0.0,
+  "pairwise_accuracy": 0.0,
+  "per_cwe_f1": {
+    "CWE-121": 0.0,
+    "CWE-122": 0.0,
+    "CWE-134": 0.0,
+    "CWE-190": 0.0,
+    "CWE-416": 0.0,
+    "CWE-476": 0.0,
+    "CWE-78": 0.0
+  },
+  "worst_group_f1": 0.0,
+  "proof_positive": false,
+  "timestamp": "2026-03-18T10:19:23.336686+00:00",
+  "device": "cpu",
+  "test_samples": 3470,
+  "tpg_delta": 0.0,
+  "config_D_pairwise": 0.0
+}

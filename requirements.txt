@@ -4,19 +4,20 @@
 # NumPy: MUST be <2.0 for binary compatibility with PyTorch pre-compiled wheels
 numpy>=1.26.4,<2.0
 
-# PyTorch: Runtime-detected in Colab (typically 2.x)
-torch>=2.0.0
+# PyTorch: >=2.2 required for torch.compile + GatedGraphConv compatibility
+torch>=2.2.0
 torchvision>=0.15.0
 
-# Transformers: Locked with compatible tokenizers for Colab training
-transformers==4.35.0            # Tested and stable
-tokenizers>=0.14.0,<0.15        # Compatible with transformers 4.35.0
+# Transformers: pinned to 4.44.0 (>=4.45 has CVE-2025-32434 check requiring torch>=2.6, incompatible with cu118)
+transformers==4.44.0
+tokenizers>=0.15.0
 accelerate>=0.24.0              # For mixed precision training
 
-# PyTorch Geometric: Installed via runtime-aware wheels in Colab notebook
-torch-geometric==2.4.0
-# Note: torch-scatter, torch-sparse, torch-cluster, torch-spline-conv
+# PyTorch Geometric: >=2.4 for GatedGraphConv + global_mean_pool
+torch-geometric>=2.4.0
+# Note: torch-sparse, torch-cluster, torch-spline-conv
 # are installed with version-specific wheel URLs in the notebook
+# torch-scatter removed: replaced by torch_geometric.utils.softmax (no separate wheel needed)
 
 # Optional: Only for local development (causes conflicts in Colab)
 # sentence-transformers>=2.7.0  # Commented out - conflicts with transformers 4.35.0
@@ -26,11 +27,9 @@ captum>=0.7.0  # Integrated Gradients
 shap>=0.45.0
 lime>=0.2.0.1
 
-# Code Analysis
-tree-sitter==0.20.4              # Tested and stable for Colab
-# tree-sitter-c>=0.24.0          # Cloned from GitHub in notebook
-# tree-sitter-python>=0.21.0
-# tree-sitter-javascript>=0.21.0
+# Code Analysis — tree-sitter >=0.22 uses new Language() API (breaking change from 0.20)
+tree-sitter>=0.22.0
+tree-sitter-c>=0.23.0              # C parser for CPG function extraction
 
 # Graph Database (NEW)
 neo4j>=5.19.0
@@ -76,7 +75,18 @@ python-dotenv>=1.0.1
 rich>=13.7.1
 click>=8.1.7
 watchdog>=4.0.0  # File monitoring
+ratelimit>=2.2.1  # Token bucket rate limiting
 
 # Additional dependencies for Git operations
 GitPython>=3.1.43
 requests>=2.31.0
+
+# StreamGuard v2 — CFA-GNN Pipeline
+anthropic>=0.30.0                # LLM CFA generation (Stage 3, used in M2)
+tenacity>=8.2.0                  # Retry with exponential backoff for collectors
+loguru>=0.7.0                    # Structured logging across pipeline stages
+datasketch>=1.6.0                # MinHash LSH for near-deduplication (Stage 2)
+h5py>=3.10.0                     # HDF5 graph tensor cache (Stage 6)
+mlflow>=2.12.0                   # Experiment tracking for ablation study
+chardet>=5.2.0                   # Encoding detection for SARD files
+networkx>=3.2                    # Graph algorithms for TPG BFS + context slicing

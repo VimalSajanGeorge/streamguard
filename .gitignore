@@ -59,6 +59,12 @@ outputs/
 *.tmp
 *.backup
 
+# Large data files (uploaded to Drive, not git)
+*.zip
+training/data/
+training/checkpoints/
+mlruns/
+
 # LR Finder cache
 .lr_cache/
 training/.lr_cache/
