@@ -11,21 +11,42 @@ Output: training/data/graphs/all_graphs.h5  (HDF5 with all PyG-compatible graph 
 Per-sample pipeline:
   1. Load CPG JSON (nodes, edges, metadata)
   2. Load corresponding .npz (node features, shape (N, 824))
-  3. Build node_id → contiguous index mapping (0..N-1)
+  3. Build node_id -> contiguous index mapping (0..N-1)
   4. Construct edge_index (2, E) int64 COO format via remapped indices
-  5. Extract edge_attr (E,) int64 — edge types {AST=0, CFG=1, DFG=2, TPG=3}
-  6. Validate: num_nodes >= 3, edge_index OOB check, no NaN in features
+  5. Extract edge_attr (E,) int64 -- edge types {AST=0, CFG=1, DFG=2, TPG=3}
+  6. Validate through 7 gates (trivial, shape, NaN, edge_type, OOB, dangling, no-edges)
   7. Save to HDF5 with atomic write (.tmp + os.replace)
 
+HDF5 Schema (Phase 3):
+  /metadata/
+    feature_dim (attr) = 824
+    num_graphs (attr) = N
+    sample_ids, labels, cwes, pair_ids  (datasets)
+  /graphs/{idx}/
+    x          (num_nodes, 824)  float32
+    edge_index (2, num_edges)    int64
+    edge_attr  (num_edges,)      int64
+    y          scalar            int64
+    attrs: cwe, pair_id, source, sample_id  (strings)
+
+Seven Validation Gates:
+  Gate 1: Trivial graph (num_nodes < 3)
+  Gate 2: Feature shape mismatch (x.shape[1] != 824)
+  Gate 3: NaN in features
+  Gate 4: Edge type out of range (>= 4)
+  Gate 5: Edge index out of bounds (edge_index.max() >= num_nodes)
+  Gate 6: Dangling edges (edge src/dst IDs not in node ID set)
+  Gate 7: No valid edges after filtering
+
 Risk mitigations (from StreamGuard_Stories5to8_RiskAnalysis.docx):
-  - R1: Edge index OOB check — CUDA crash prevention
-  - R2: Edge type range check — only {0,1,2,3} allowed; >=4 causes GGNN crash
-  - R3: Atomic HDF5 write — prevents corruption on interrupt
-  - R4: NaN validation — prevents silent training corruption
-  - R5: Trivial graph rejection — num_nodes >= 3
+  - R1: Edge index OOB check -- CUDA crash prevention
+  - R2: Edge type range check -- only {0,1,2,3}; >=4 crashes GGNN
+  - R3: Atomic HDF5 write -- prevents corruption on interrupt
+  - R4: NaN validation -- prevents silent training corruption
+  - R5: Trivial graph rejection -- num_nodes >= 3
   - R6: feature_dim=824 stored in HDF5 attrs for model loading
 
-Source: docs/New Docs/PREPROCESSING.md §Stage 6
+Source: docs/New Docs/PREPROCESSING.md SS Stage 6
 """
 from __future__ import annotations
 
@@ -34,11 +55,11 @@ import json
 import os
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import h5py
 import numpy as np
-import torch
 from loguru import logger
 
 # ── Constants ────────────────────────────────────────────────────
@@ -46,15 +67,20 @@ FEATURE_DIM = 824
 VALID_EDGE_TYPES = {0, 1, 2, 3}  # AST, CFG, DFG, TPG
 MIN_NODES = 3
 
+# Sentinel pair_id values treated as absent
+_EMPTY_PAIR_IDS = {"", "None", "null", "0", "none"}
+
 
 # ── Load and validate one sample ─────────────────────────────────
 def load_sample(
     cpg_path: Path,
     npz_path: Path,
-) -> dict | None:
+) -> tuple[dict | None, str]:
     """
     Load CPG JSON + embedding .npz for one sample.
-    Returns a validated dict with all fields needed for HDF5, or None on failure.
+    Returns (validated_dict, "") on success, or (None, gate_reason) on failure.
+    gate_reason is one of: "load_error", "gate1_trivial", "gate2_shape",
+    "gate3_nan", "gate4_edge_type", "gate5_oob", "gate6_dangling", "gate7_no_edges".
     """
     sample_id = cpg_path.stem
 
@@ -63,7 +89,7 @@ def load_sample(
         cpg = json.loads(cpg_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         logger.debug(f"Bad CPG JSON for {sample_id}: {exc}")
-        return None
+        return None, "load_error"
 
     nodes = cpg.get("nodes", [])
     edges = cpg.get("edges", [])
@@ -74,67 +100,82 @@ def load_sample(
         node_features = data["node_features"]
     except Exception as exc:
         logger.debug(f"Bad .npz for {sample_id}: {exc}")
-        return None
+        return None, "load_error"
 
     n_nodes = len(nodes)
 
-    # ── Validation Gate 1: Trivial graph ─────────────────────────
+    # ── Gate 1: Trivial graph ────────────────────────────────────
     if n_nodes < MIN_NODES:
-        logger.debug(f"Trivial graph {sample_id}: {n_nodes} nodes < {MIN_NODES}")
-        return None
+        logger.debug(f"Gate 1: Trivial graph {sample_id}: {n_nodes} nodes < {MIN_NODES}")
+        return None, "gate1_trivial"
 
-    # ── Validation Gate 2: Feature shape match ───────────────────
+    # ── Gate 2: Feature shape match ──────────────────────────────
     if node_features.shape != (n_nodes, FEATURE_DIM):
         logger.debug(
-            f"Feature shape mismatch {sample_id}: "
+            f"Gate 2: Feature shape mismatch {sample_id}: "
             f"{node_features.shape} vs ({n_nodes}, {FEATURE_DIM})"
         )
-        return None
+        return None, "gate2_shape"
 
-    # ── Validation Gate 3: No NaN in features ────────────────────
+    # ── Gate 3: No NaN in features ───────────────────────────────
     if np.isnan(node_features).any():
-        logger.warning(f"NaN in features for {sample_id} — rejected")
-        return None
+        logger.warning(f"Gate 3: NaN in features for {sample_id}")
+        return None, "gate3_nan"
 
-    # ── Build node_id → contiguous index mapping ─────────────────
+    # ── Gate 4 prep: Build node_id -> contiguous index mapping ───
     node_id_to_idx = {n["id"]: i for i, n in enumerate(nodes)}
 
-    # ── Build edge_index and edge_attr ───────────────────────────
+    # ── Build edge_index and edge_type ───────────────────────────
     src_list: list[int] = []
     dst_list: list[int] = []
-    attr_list: list[int] = []
+    type_list: list[int] = []
+    dangling_count = 0
+    bad_type_count = 0
 
     for e in edges:
         src_id = e["src"]
         dst_id = e["dst"]
         etype = e["type"]
 
-        # Skip edges referencing unknown nodes (defensive)
+        # Gate 6: Dangling edges — src/dst not in node set
         if src_id not in node_id_to_idx or dst_id not in node_id_to_idx:
+            dangling_count += 1
             continue
 
-        # Validation Gate 4: Edge type range
+        # Gate 4: Edge type out of range
         if etype not in VALID_EDGE_TYPES:
-            logger.debug(f"Invalid edge type {etype} in {sample_id} — skipped")
+            bad_type_count += 1
+            logger.debug(f"Gate 4: Invalid edge type {etype} in {sample_id}")
             continue
 
         src_list.append(node_id_to_idx[src_id])
         dst_list.append(node_id_to_idx[dst_id])
-        attr_list.append(etype)
+        type_list.append(etype)
 
+    # If ALL edges were dangling (no valid ones left), reject via Gate 6
+    if not src_list and dangling_count > 0:
+        logger.debug(f"Gate 6: All {dangling_count} edges dangling in {sample_id}")
+        return None, "gate6_dangling"
+
+    # If ALL edges had bad types (no valid ones left), reject via Gate 4
+    if not src_list and bad_type_count > 0:
+        logger.debug(f"Gate 4: All {bad_type_count} edges had invalid type in {sample_id}")
+        return None, "gate4_edge_type"
+
+    # ── Gate 7: No valid edges after filtering ───────────────────
     if not src_list:
-        logger.debug(f"No valid edges for {sample_id}")
-        return None
+        logger.debug(f"Gate 7: No valid edges for {sample_id}")
+        return None, "gate7_no_edges"
 
     edge_index = np.array([src_list, dst_list], dtype=np.int64)
-    edge_attr = np.array(attr_list, dtype=np.int64)
+    edge_attr = np.array(type_list, dtype=np.int64)
 
-    # ── Validation Gate 5: Edge index OOB ────────────────────────
+    # ── Gate 5: Edge index OOB ───────────────────────────────────
     if edge_index.max() >= n_nodes:
         logger.warning(
-            f"Edge index OOB in {sample_id}: max={edge_index.max()} >= {n_nodes}"
+            f"Gate 5: Edge index OOB in {sample_id}: max={edge_index.max()} >= {n_nodes}"
         )
-        return None
+        return None, "gate5_oob"
 
     return {
         "sample_id": sample_id,
@@ -147,7 +188,7 @@ def load_sample(
         "edge_attr": edge_attr,
         "num_nodes": n_nodes,
         "num_edges": len(src_list),
-    }
+    }, ""
 
 
 # ── HDF5 writer ──────────────────────────────────────────────────
@@ -159,7 +200,7 @@ def write_graphs_h5(
     Write all validated graph samples to HDF5.
     Uses atomic write: writes to .tmp then os.replace().
 
-    HDF5 structure:
+    HDF5 structure (Phase 3):
       /metadata/
         feature_dim (attr) = 824
         num_graphs (attr) = N
@@ -172,6 +213,7 @@ def write_graphs_h5(
         edge_index = (2, N_edges) int64
         edge_attr  = (N_edges,) int64
         y          = (1,) int64
+        attrs: pair_id, cwe, source, sample_id  (strings)
     """
     tmp_path = output_path.with_suffix(".h5.tmp")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -206,12 +248,65 @@ def write_graphs_h5(
             g.create_dataset("edge_attr", data=s["edge_attr"])
             g.create_dataset("y", data=np.array([s["label"]], dtype=np.int64))
 
+            # Per-graph attrs (Phase 3 — critical for Stage 7 pair lookup)
+            g.attrs["pair_id"] = s.get("pair_id", "")
+            g.attrs["cwe"] = s.get("cwe", "")
+            g.attrs["source"] = s.get("source", "")
+            g.attrs["sample_id"] = s.get("sample_id", "")
+
     # Atomic rename
     os.replace(tmp_path, output_path)
 
     return {
         "num_graphs": n_graphs,
         "output_path": str(output_path),
+    }
+
+
+# ── Post-write pair integrity check ─────────────────────────────
+def check_pair_integrity(h5_path: str | Path) -> dict:
+    """
+    Verify pair_id linkage in HDF5: each non-empty pair_id should have
+    at least one label=0 and one label=1 sample.
+
+    Returns dict with: total_pairs, valid_pairs, broken_pairs, broken_detail.
+    """
+    path = Path(h5_path)
+    pairs: dict[str, list[int]] = defaultdict(list)
+
+    with h5py.File(path, "r") as f:
+        graphs = f["graphs"]
+        for idx in graphs:
+            g = graphs[idx]
+            pair_id = g.attrs.get("pair_id", "")
+            if pair_id in _EMPTY_PAIR_IDS:
+                continue
+            label = int(g["y"][()][0])
+            pairs[pair_id].append(label)
+
+    broken = {
+        k: v for k, v in pairs.items()
+        if 0 not in v or 1 not in v
+    }
+
+    total = len(pairs)
+    n_broken = len(broken)
+
+    if n_broken > 0:
+        logger.warning(
+            f"Pair integrity: {n_broken}/{total} pairs broken "
+            f"(will be treated as singletons in Stage 7)"
+        )
+        for pid, labels in list(broken.items())[:5]:
+            logger.warning(f"  broken pair {pid[:16]}...: labels={labels}")
+    else:
+        logger.info(f"Pair integrity: {total} pairs, all valid")
+
+    return {
+        "total_pairs": total,
+        "valid_pairs": total - n_broken,
+        "broken_pairs": n_broken,
+        "broken_detail": {k: v for k, v in list(broken.items())[:20]},
     }
 
 
@@ -222,6 +317,7 @@ def run_stage6(
     output_path: str,
     dry_run: bool = False,
     max_samples: int | None = None,
+    check_pairs: bool = False,
 ) -> dict:
     """
     Run Stage 6: assemble PyG-compatible graph tensors into HDF5.
@@ -293,14 +389,22 @@ def run_stage6(
     start_time = time.time()
     valid_samples: list[dict] = []
     failed = 0
-    reject_reasons: dict[str, int] = {}
+    reject_reasons: dict[str, int] = defaultdict(int)
+    reject_log_path = out_path.with_name("graph_rejected.log")
+
+    # Open rejection log
+    reject_log_path.parent.mkdir(parents=True, exist_ok=True)
+    reject_fh = open(reject_log_path, "w", encoding="utf-8")
+    reject_fh.write("sample_id\tgate\n")
 
     for i, (cpg_path, npz_path) in enumerate(matched):
-        result = load_sample(cpg_path, npz_path)
+        result, gate = load_sample(cpg_path, npz_path)
         if result is not None:
             valid_samples.append(result)
         else:
             failed += 1
+            reject_reasons[gate] += 1
+            reject_fh.write(f"{cpg_path.stem}\t{gate}\n")
 
         if (i + 1) % 500 == 0 or (i + 1) == n_matched:
             elapsed = time.time() - start_time
@@ -311,9 +415,14 @@ def run_stage6(
                 flush=True,
             )
 
+    reject_fh.close()
+
+    if reject_reasons:
+        logger.info(f"Rejection breakdown: {dict(reject_reasons)}")
+
     if not valid_samples:
-        logger.error("No valid samples — nothing to write!")
-        return {"num_graphs": 0, "failed": failed}
+        logger.error("No valid samples -- nothing to write!")
+        return {"num_graphs": 0, "failed": failed, "reject_reasons": dict(reject_reasons)}
 
     # Write HDF5 (atomic)
     logger.info(f"Writing {len(valid_samples)} graphs to {output_path}")
@@ -325,17 +434,24 @@ def run_stage6(
     total_nodes = sum(s["num_nodes"] for s in valid_samples)
     total_edges = sum(s["num_edges"] for s in valid_samples)
 
+    # Per-CWE distribution
+    cwe_distribution: dict[str, int] = defaultdict(int)
+    for s in valid_samples:
+        cwe_distribution[s["cwe"]] += 1
+
     stats = {
         "total_cpgs_found": n_total_cpg,
         "matched_pairs": n_matched,
         "no_embedding": no_embed,
         "valid_graphs": len(valid_samples),
         "failed": failed,
+        "reject_reasons": dict(reject_reasons),
         "total_nodes": total_nodes,
         "total_edges": total_edges,
-        "avg_nodes": total_nodes / len(valid_samples),
-        "avg_edges": total_edges / len(valid_samples),
+        "avg_nodes": round(total_nodes / len(valid_samples), 1),
+        "avg_edges": round(total_edges / len(valid_samples), 1),
         "feature_dim": FEATURE_DIM,
+        "cwe_distribution": dict(sorted(cwe_distribution.items())),
         "elapsed_seconds": round(elapsed, 1),
         "output_path": str(out_path),
     }
@@ -344,6 +460,13 @@ def run_stage6(
     stats_path = out_path.with_name("graph_stats.json")
     stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
     logger.info(f"Stage 6 complete: {json.dumps(stats, indent=2)}")
+
+    # Post-write pair integrity check
+    if check_pairs:
+        pair_result = check_pair_integrity(out_path)
+        stats["pair_integrity"] = pair_result
+        # Re-save stats with pair info
+        stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
 
     return stats
 
@@ -377,11 +500,17 @@ def verify_h5(h5_path: str, max_check: int = 3) -> None:
             g = graphs[idx]
             x = g["x"][:]
             ei = g["edge_index"][:]
-            ea = g["edge_attr"][:]
+            et = g["edge_attr"][:]
             y = g["y"][:]
 
             n_nodes = x.shape[0]
-            n_edges = ea.shape[0]
+            n_edges = et.shape[0]
+
+            # Read per-graph attrs
+            pair_id = g.attrs.get("pair_id", "")
+            cwe = g.attrs.get("cwe", "")
+            source = g.attrs.get("source", "")
+            sid = g.attrs.get("sample_id", "")
 
             # Validate
             assert x.shape[1] == FEATURE_DIM
@@ -390,19 +519,17 @@ def verify_h5(h5_path: str, max_check: int = 3) -> None:
             assert n_nodes >= MIN_NODES, f"Trivial graph {idx}"
             if n_edges > 0:
                 assert ei.max() < n_nodes, f"Edge OOB in graph {idx}"
-                assert ea.max() <= 3, f"Invalid edge type in graph {idx}"
-
-            sample_id = meta["sample_ids"][int(idx)].decode() if isinstance(
-                meta["sample_ids"][int(idx)], bytes
-            ) else str(meta["sample_ids"][int(idx)])
+                assert et.max() < 4, f"Invalid edge type in graph {idx}"
 
             print(
-                f"\n  Graph {idx} ({sample_id[:16]}...):"
+                f"\n  Graph {idx} ({sid[:16]}...):"
                 f"\n    x:          {x.shape} {x.dtype}"
                 f"\n    edge_index: {ei.shape} {ei.dtype}"
-                f"\n    edge_attr:  {ea.shape} {ea.dtype} types={set(ea.tolist())}"
+                f"\n    edge_attr:  {et.shape} {et.dtype} types={set(et.tolist())}"
                 f"\n    y:          {y} (label)"
-                f"\n    NaN:        {np.isnan(x).any()}"
+                f"\n    cwe:        {cwe}"
+                f"\n    pair_id:    {pair_id[:16] + '...' if len(pair_id) > 16 else pair_id or 'none'}"
+                f"\n    source:     {source}"
             )
             checked += 1
 
@@ -412,7 +539,7 @@ def verify_h5(h5_path: str, max_check: int = 3) -> None:
 # ── CLI ──────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Stage 6: Graph Tensor Assembly — CPG + embeddings → HDF5",
+        description="Stage 6: Graph Tensor Assembly -- CPG + embeddings -> HDF5",
     )
     parser.add_argument(
         "--cpg-dir",
@@ -445,6 +572,11 @@ def main():
         action="store_true",
         help="Verify output HDF5 after writing",
     )
+    parser.add_argument(
+        "--check-pairs",
+        action="store_true",
+        help="Run post-write pair_id integrity check",
+    )
 
     args = parser.parse_args()
 
@@ -454,6 +586,7 @@ def main():
         output_path=args.output,
         dry_run=args.dry_run,
         max_samples=args.max_samples,
+        check_pairs=args.check_pairs,
     )
 
     if not args.dry_run or args.verify:

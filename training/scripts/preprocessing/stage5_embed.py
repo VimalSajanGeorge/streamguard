@@ -533,6 +533,19 @@ def run_stage5(
     nan_rejected = 0
     total_nodes = 0
 
+    # C1: CFA vs original source tracking
+    cfa_samples = 0
+    original_samples = 0
+
+    # C3: Per-CWE accumulators for embed_stats_by_cwe.json
+    cwe_accum: dict[str, dict] = defaultdict(lambda: {
+        "count": 0, "total_nodes": 0, "total_taint_nodes": 0, "total_dfg_degree": 0,
+    })
+
+    # C4: Anomaly counters
+    anomaly_high_value = 0
+    anomaly_missing_type = 0
+
     for i, cpg_path in enumerate(to_process):
         sample_id = cpg_path.stem
 
@@ -557,17 +570,62 @@ def run_stage5(
             failed += 1
             continue
 
-        # Validate shape
+        # C2: Strict 824-d column assertion (catches upstream CPG structure changes)
+        assert features.shape[1] == TOTAL_DIM, (
+            f"Wrong feature dim: {features.shape} — expected {TOTAL_DIM} columns"
+        )
+
+        # Validate full shape (rows must match node count)
         n_nodes = len(cpg["nodes"])
         assert features.shape == (n_nodes, TOTAL_DIM), (
             f"Shape mismatch: {features.shape} vs ({n_nodes}, {TOTAL_DIM})"
         )
+
+        # C4: Anomaly detection
+        feat_max = features.max()
+        if feat_max > 100:
+            logger.warning(
+                f"Anomaly: {sample_id} has features.max()={feat_max:.1f} "
+                f"(CodeBERT values should not exceed ~15)"
+            )
+            anomaly_high_value += 1
+
+        node_type_sums = features[:, 768:800].sum(axis=1)
+        n_missing_type = int((node_type_sums == 0).sum())
+        if n_missing_type > 0:
+            logger.warning(
+                f"Anomaly: {sample_id} has {n_missing_type} nodes with no type label "
+                f"(all zeros in [768:800])"
+            )
+            anomaly_missing_type += 1
 
         # Save
         out_path = _output_path(out, sample_id)
         np.savez_compressed(out_path, node_features=features)
         succeeded += 1
         total_nodes += n_nodes
+
+        # C1: Track source type
+        source = cpg.get("source", "")
+        if source.endswith("_cfa"):
+            cfa_samples += 1
+        else:
+            original_samples += 1
+
+        # C3: Accumulate per-CWE stats
+        cwe = cpg.get("cwe", "UNKNOWN")
+        acc = cwe_accum[cwe]
+        acc["count"] += 1
+        acc["total_nodes"] += n_nodes
+        # Count taint nodes (SOURCE, SINK, SANITIZER, PROPAGATION — not NONE)
+        taint_count = sum(
+            1 for n in cpg["nodes"]
+            if n.get("taint_role", "NONE") not in ("NONE", "")
+        )
+        acc["total_taint_nodes"] += taint_count
+        # DFG degree: count DFG edges
+        dfg_edges = sum(1 for e in cpg["edges"] if e.get("type") == 2)
+        acc["total_dfg_degree"] += dfg_edges
 
         # Progress
         if (i + 1) % 50 == 0 or (i + 1) == n_process:
@@ -598,12 +656,34 @@ def run_stage5(
         "elapsed_seconds": round(elapsed, 1),
         "samples_per_second": round(succeeded / max(elapsed, 0.001), 2),
         "feature_dim": TOTAL_DIM,
+        # C1: Source breakdown
+        "cfa_samples": cfa_samples,
+        "original_samples": original_samples,
+        # C4: Anomaly counts
+        "anomaly_high_value": anomaly_high_value,
+        "anomaly_missing_type": anomaly_missing_type,
     }
 
     # Save stats
     stats_path = out / "embed_stats.json"
     stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
     logger.info(f"Stage 5 complete: {json.dumps(stats, indent=2)}")
+
+    # C3: Save per-CWE embedding stats
+    cwe_stats = {}
+    for cwe, acc in sorted(cwe_accum.items()):
+        count = acc["count"]
+        cwe_stats[cwe] = {
+            "sample_count": count,
+            "avg_node_count": round(acc["total_nodes"] / max(count, 1), 1),
+            "avg_taint_node_pct": round(
+                acc["total_taint_nodes"] / max(acc["total_nodes"], 1) * 100, 2
+            ),
+            "avg_dfg_degree": round(acc["total_dfg_degree"] / max(count, 1), 1),
+        }
+    cwe_stats_path = out / "embed_stats_by_cwe.json"
+    cwe_stats_path.write_text(json.dumps(cwe_stats, indent=2), encoding="utf-8")
+    logger.info(f"Per-CWE stats saved to {cwe_stats_path}")
 
     return stats
 
