@@ -106,6 +106,15 @@ class CollectorProcess:
             from dotenv import load_dotenv
             load_dotenv()
 
+            # #region agent log - Hypothesis A: Check env vars loaded in subprocess
+            import os as _os
+            _log_path = r"c:\Users\Vimal Sajan\streamguard\.cursor\debug.log"
+            _gh_token = _os.getenv("GITHUB_TOKEN", "")
+            _gh_tokens = _os.getenv("GITHUB_TOKENS", "")
+            _nvd_key = _os.getenv("NVD_API_KEY", "")
+            with open(_log_path, "a") as _f: _f.write('{"hypothesisId":"A","location":"orchestrator:108","message":"env_vars_in_subprocess","data":{"collector":"'+name+'","gh_token_len":'+str(len(_gh_token))+',"gh_tokens_len":'+str(len(_gh_tokens))+',"nvd_key_len":'+str(len(_nvd_key))+',"gh_token_first20":"'+_gh_token[:20]+'"},"timestamp":'+str(int(datetime.now().timestamp()*1000))+'}\n')
+            # #endregion
+
             queue.put({
                 'collector': name,
                 'status': 'starting',
@@ -170,10 +179,15 @@ class CollectorProcess:
             # Run collection with progress updates
             start_time = time.time()
 
+            # #region agent log - Hypothesis B: Check if collector methods run and return
+            _log_path = r"c:\Users\Vimal Sajan\streamguard\.cursor\debug.log"
+            with open(_log_path, "a") as _f: _f.write('{"hypothesisId":"B","location":"orchestrator:173","message":"before_collect","data":{"collector":"'+name+'","target_samples":'+str(target_samples)+'},"timestamp":'+str(int(datetime.now().timestamp()*1000))+'}\n')
+            # #endregion
+
             if name == 'cve':
                 samples = collector.collect()
             elif name == 'github':
-                samples = collector.collect_all_advisories(target_samples)
+                samples = collector.collect_all_advisories(target_samples, queue=queue)
             elif name == 'repo':
                 samples = collector.collect()
             elif name == 'synthetic':
@@ -185,6 +199,10 @@ class CollectorProcess:
 
             end_time = time.time()
             duration = end_time - start_time
+
+            # #region agent log - Hypothesis B: Check samples returned
+            with open(_log_path, "a") as _f: _f.write('{"hypothesisId":"B","location":"orchestrator:195","message":"after_collect","data":{"collector":"'+name+'","samples_count":'+str(len(samples) if samples else 0)+',"duration":'+str(duration)+'},"timestamp":'+str(int(datetime.now().timestamp()*1000))+'}\n')
+            # #endregion
 
             # Send completion update
             queue.put({
@@ -199,6 +217,12 @@ class CollectorProcess:
             })
 
         except Exception as e:
+            # #region agent log - Hypothesis D: Catch all errors
+            _log_path = r"c:\Users\Vimal Sajan\streamguard\.cursor\debug.log"
+            import traceback as _tb
+            with open(_log_path, "a") as _f: _f.write('{"hypothesisId":"D","location":"orchestrator:210","message":"collector_exception","data":{"collector":"'+name+'","error":"'+str(e).replace('"','\\"')[:300]+'","traceback":"'+_tb.format_exc().replace('"','\\"').replace('\n','\\n')[:500]+'"},"timestamp":'+str(int(datetime.now().timestamp()*1000))+'}\n')
+            # #endregion
+            
             # Send error update
             queue.put({
                 'collector': name,

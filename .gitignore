@@ -63,7 +63,11 @@ outputs/
 *.zip
 training/data/
 training/checkpoints/
+training/scripts/collection/data/
 mlruns/
+
+# Gemini agent
+.gemini/
 
 # LR Finder cache
 .lr_cache/

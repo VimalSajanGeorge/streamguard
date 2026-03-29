@@ -1,0 +1,1235 @@
+# CFA-GNN Proof on SARD — Technical Implementation Plan
+
+**Milestone:** M1 — Prove CFA + GGNN works on SARD before full data collection
+**Goal:** Binary F1 ≥ 0.85; CFA pairwise accuracy ≥ 0.80 on SARD data
+**Duration:** 3–4 weeks | **Total Stories:** 8
+
+---
+
+## Reference Documents (ONLY these — discard all old docs)
+
+| Doc | Path | What It Defines |
+|-----|------|-----------------|
+| CLAUDE.md | [docs/New Docs/CLAUDE.md](file:///c:/Users/Vimal%20Sajan/streamguard/docs/New%20Docs/CLAUDE.md) | Master rules, implementation order, critical paths |
+| PRD.md | [docs/New Docs/PRD.md](file:///c:/Users/Vimal%20Sajan/streamguard/docs/New%20Docs/PRD.md) | Functional requirements, quality gates, loss formula |
+| ARCHITECTURE.md | [docs/New Docs/ARCHITECTURE.md](file:///c:/Users/Vimal%20Sajan/streamguard/docs/New%20Docs/ARCHITECTURE.md) | 5-plane architecture, data flow, storage |
+| DATA_PIPELINE.md | [docs/New Docs/DATA_PIPELINE.md](file:///c:/Users/Vimal%20Sajan/streamguard/docs/New%20Docs/DATA_PIPELINE.md) | Schema, BaseCollector, SARD Collector spec |
+| PREPROCESSING.md | [docs/New Docs/PREPROCESSING.md](file:///c:/Users/Vimal%20Sajan/streamguard/docs/New%20Docs/PREPROCESSING.md) | 7-stage pipeline code, per-CWE prompts |
+| MODEL.md | [docs/New Docs/MODEL.md](file:///c:/Users/Vimal%20Sajan/streamguard/docs/New%20Docs/MODEL.md) | StreamGuardModel code, losses, CFA DataLoader, training loop |
+| NOVELTY.md | [docs/New Docs/NOVELTY.md](file:///c:/Users/Vimal%20Sajan/streamguard/docs/New%20Docs/NOVELTY.md) | 6 research novelties, ablation design |
+| EXPERIMENTS.md | [docs/New Docs/EXPERIMENTS.md](file:///c:/Users/Vimal%20Sajan/streamguard/docs/New%20Docs/EXPERIMENTS.md) | 5-config ablation, metrics, per-CWE F1 targets |
+
+> [!CAUTION]
+> **Do NOT reference these old files:** [docs/01_setup.md](file:///c:/Users/Vimal%20Sajan/streamguard/docs/01_setup.md), [docs/02_ml_training.md](file:///c:/Users/Vimal%20Sajan/streamguard/docs/02_ml_training.md), [docs/03_explainability.md](file:///c:/Users/Vimal%20Sajan/streamguard/docs/03_explainability.md), [docs/agent_architecture.md](file:///c:/Users/Vimal%20Sajan/streamguard/docs/agent_architecture.md), [docs/claude.md](file:///c:/Users/Vimal%20Sajan/streamguard/docs/claude.md) (lowercase), [docs/ARCHITECTURE_AND_IMPROVEMENT_STRATEGY.md](file:///c:/Users/Vimal%20Sajan/streamguard/docs/ARCHITECTURE_AND_IMPROVEMENT_STRATEGY.md), or any PDF in `docs/`. The new docs in `docs/New Docs/` supersede everything.
+
+---
+
+## Story 1: Environment & Dependencies
+
+**Goal:** Verify all tools work: Python ≥3.10, PyTorch ≥2.2, Joern 2.x, CodeBERT, tree-sitter-c, gcc.
+
+### 1.1 Update `requirements.txt`
+
+**File:** `requirements.txt`
+**Source:** `CLAUDE.md` §Environment Requirements
+
+Add/update these lines:
+```
+torch>=2.2.0
+torch-geometric>=2.4.0
+transformers>=4.38.0
+tree-sitter>=0.22.0
+tree-sitter-c>=0.23.0
+anthropic>=0.30.0
+tenacity>=8.2.0
+loguru>=0.7.0
+datasketch>=1.6.0
+h5py>=3.10.0
+mlflow>=2.12.0
+chardet>=5.2.0
+networkx>=3.2
+```
+
+Remove/replace:
+```
+tree-sitter==0.20.4          → tree-sitter>=0.22.0
+tree-sitter-languages>=1.10  → REMOVE (use tree-sitter-c instead)
+transformers==4.35.0         → transformers>=4.38.0
+torch-geometric==2.4.0       → torch-geometric>=2.4.0
+```
+
+### 1.2 Install & Verify Joern
+
+```bash
+# Download Joern 2.x (JVM 17+ required)
+# Set JOERN_BIN in .env
+# Smoke test:
+echo 'void foo(char *s) { strcpy(buf, s); }' > /tmp/test.c
+$JOERN_BIN --script generate_cpg.sc --params inputFile=/tmp/test.c
+# Must produce nodes with AST+CFG+DFG edges
+```
+
+### 1.3 Verify CodeBERT
+
+```python
+from transformers import AutoModel, AutoTokenizer
+tok = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+mdl = AutoModel.from_pretrained("microsoft/codebert-base")
+inp = tok("void foo() { return; }", return_tensors="pt", max_length=64, truncation=True)
+out = mdl(**inp)
+assert out.last_hidden_state.shape[-1] == 768  # [CLS] must be 768-d
+```
+
+### 1.4 Verify tree-sitter-c
+
+```python
+from tree_sitter import Language, Parser
+import tree_sitter_c as tsc
+C_LANG = Language(tsc.language())
+parser = Parser(C_LANG)
+tree = parser.parse(b"void foo() { int x = 1; }")
+assert tree.root_node.type == "translation_unit"
+assert any(n.type == "function_definition" for n in tree.root_node.children)
+```
+
+### 1.5 Update `.env`
+
+**File:** `.env`
+```
+ANTHROPIC_API_KEY=...             # For Stage 3 CFA (M2, not needed for M1)
+GITHUB_TOKEN=...                  # Existing, keep
+NVD_API_KEY=...                   # Existing, keep
+JOERN_BIN=/path/to/joern-cli/joern
+JOERN_EXPORT=/path/to/joern-cli/joern-export
+STREAMGUARD_DATA_DIR=./training/data
+STREAMGUARD_CHECKPOINT_DIR=./training/checkpoints
+```
+
+### Acceptance Criteria
+- [ ] `pip install -r requirements.txt` succeeds
+- [ ] `python -c "import torch_geometric; print(torch_geometric.__version__)"` prints ≥2.4.0
+- [ ] Joern produces CPG JSON from a 5-line C function
+- [ ] CodeBERT [CLS] embedding is 768-d
+- [ ] tree-sitter-c parses `function_definition` in C code
+
+### Production Issues
+| Issue | Impact | Fix |
+|-------|--------|-----|
+| `tree-sitter>=0.22` API breaking change | Old code uses `Language.build_library()`. New API uses `Language(tsc.language())` | Update all tree-sitter usage to new API — do NOT mix old and new |
+| Joern JVM default heap 512MB | OOM on 200+ line functions | Set `_JAVA_OPTIONS="-Xmx4g"` in `.env` or shell profile |
+| `torch-geometric` version mismatch with CUDA | GatedGraphConv might not exist in very old PyG | Use `>=2.4.0` and verify `from torch_geometric.nn import GatedGraphConv` |
+
+---
+
+## Story 2: Schema & Base Collector Rewrite
+
+**Goal:** Canonical sample format + production-grade collector base class.
+
+### 2.1 Rewrite `schema.py`
+
+**File:** `training/scripts/collection/schema.py`
+**Source:** `DATA_PIPELINE.md` §Canonical Sample Schema
+
+The existing `schema.py` uses a `VulnSample` dataclass with `vuln_type` field. The new schema needs:
+
+```python
+# NEW schema.py — Full spec from DATA_PIPELINE.md
+
+VALID_CWE = {
+    "CWE-89", "CWE-78", "CWE-79", "CWE-119", "CWE-120",
+    "CWE-121", "CWE-122", "CWE-125", "CWE-134", "CWE-190",
+    "CWE-416", "CWE-476"
+}
+VALID_SOURCES = {
+    "sard", "exploitdb", "cve", "github_advisory",
+    "osv", "repo", "manual",
+    "sard_cfa", "exploitdb_cfa", "cve_cfa",
+    "github_advisory_cfa", "osv_cfa", "repo_cfa",
+}
+
+def validate_sample(s: dict) -> tuple[bool, list[str]]:
+    """All errors must be empty to save."""
+    errors = []
+    # Required: id, source, code, label (0|1), cwe, language, collected_at
+    # Value validation: source in VALID_SOURCES, cwe in VALID_CWE, language == "c"
+    # Code sanity: 5 ≤ lines ≤ 500, tokens ≥ 10
+    # Returns (is_valid, errors)
+
+def make_sample_id() -> str:
+    return str(uuid.uuid4())
+
+def make_timestamp() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+```
+
+**Key changes from old schema:**
+- `VulnSample.vuln_type` → `dict.cwe` (string like "CWE-89")
+- `VulnSample.vulnerable_code` / `fixed_code` → single `code` field + `label` (0 or 1) + `pair_id`
+- Added `validate_sample()` function (did not exist before)
+- Added `pair_id` field for CFA linkage
+
+### 2.2 Rewrite `base_collector.py`
+
+**File:** `training/scripts/collection/base_collector.py`
+**Source:** `DATA_PIPELINE.md` §Base Collector Class
+
+The existing base_collector has:
+- `save_samples()` (batch save) → Need `save_sample()` (per-sample with validation)
+- `rate_limit()` (simple sleep) → Need `tenacity @retry` with exponential backoff
+- `load_cache()` / `save_cache()` → Need `load_checkpoint()` / `save_checkpoint()` with atomic writes
+- `deduplicate_samples()` (post-hoc) → Need `_seen_hashes` (in-memory dedup on save)
+- `validate_code()` (length only) → Need `validate_sample()` (full schema validation)
+
+**New base_collector.py must have:**
+```python
+class BaseCollector:
+    def __init__(self, output_dir, checkpoint_dir, source_name):
+        # output_dir, checkpoint_dir, source_name
+        # _seen_hashes: set (loaded from existing JSONL on init)
+        # _samples_saved, _samples_failed counters
+
+    @retry(stop=stop_after_attempt(5),
+           wait=wait_exponential(multiplier=1, min=2, max=60),
+           retry=retry_if_exception_type(...))
+    def safe_get(self, url, **kwargs) -> Response:
+        # Handle 429 (Retry-After header), 401 (raise)
+
+    def load_checkpoint(self) -> dict:
+        # Read {source_name}_checkpoint.json
+
+    def save_checkpoint(self, state: dict):
+        # Atomic: write .tmp → os.replace()
+
+    def save_sample(self, sample: dict) -> bool:
+        # 1. validate_sample() → reject if invalid
+        # 2. MD5 dedup check → reject if seen
+        # 3. Append to {source_name}_samples.jsonl
+        # 4. Check disk space every 100 samples
+
+    def save_failed_item(self, item: dict, reason: str):
+        # Append to {source_name}_failed.jsonl
+```
+
+### Acceptance Criteria
+- [ ] `validate_sample()` accepts a valid SARD sample dict
+- [ ] `validate_sample()` rejects samples with missing `cwe`, wrong `language`, empty `code`, etc.
+- [ ] `save_checkpoint()` + crash + `load_checkpoint()` returns saved state
+- [ ] `save_sample()` deduplicates identical code (whitespace-normalized MD5)
+- [ ] `safe_get()` retries 5 times on ConnectionError
+
+### Production Issues
+| Issue | Impact | Fix |
+|-------|--------|-----|
+| Old collectors import `from schema import VulnSample` | All collector imports break | Update all collectors' import paths. For M1, only SARD collector needs to work. |
+| `os.replace()` not atomic on Windows in some edge cases | Checkpoint corruption on crash | Use `os.replace()` which IS atomic on Windows NTFS. Verified in Python docs. |
+| `_seen_hashes` loaded from JSONL on init is O(n) | Slow restart on 50K+ samples | Acceptable for M1 (12K SARD). For M2, save hashes to separate `.pkl` file |
+
+---
+
+## Story 3: SARD Collector
+
+**Goal:** Process SARD test cases into canonical JSONL with native CFA pairs.
+
+**File:** `training/scripts/collection/process_sard.py`
+**Source:** `DATA_PIPELINE.md` §Collector 1: SARD
+
+### 3.1 SARD Data Structure
+
+```
+data/raw/sard/
+├── CWE-89/
+│   ├── CWE89_SQL_Injection__bad.c         ← label=1 (vulnerable)
+│   ├── CWE89_SQL_Injection__good.c        ← label=0 (safe) ← NATURAL CFA PAIR
+│   └── CWE89_SQL_Injection__bad_v2.c      ← label=1 (variant)
+├── CWE-120/
+│   ├── CWE120_Buffer_Copy_bad01.c
+│   ├── CWE120_Buffer_Copy_good01.c
+│   └── ...
+└── ... (12 CWE directories)
+```
+
+### 3.2 Implementation Spec
+
+```python
+class SARDProcessor(BaseCollector):
+    """
+    Process SARD test cases.
+    
+    Critical rules (from DATA_PIPELINE.md):
+    1. _bad.c / _good.c naming = native CFA pairs → set pair_id!
+    2. Extract CWE from directory name
+    3. These ARE the CFA pairs — do NOT run CFA generator on SARD
+    4. Expected: 170K+ test cases → 8K–12K unique after length filter
+    """
+
+    def process(self, sard_root: str):
+        for cwe_dir in Path(sard_root).iterdir():
+            if not cwe_dir.is_dir(): continue
+            cwe = self._extract_cwe(cwe_dir.name)  # "CWE-120" from "CWE120_Buffer_Copy"
+            if cwe not in VALID_CWE: continue
+
+            # Group files by pair base name
+            files = list(cwe_dir.rglob("*.c"))
+            pairs = self._match_pairs(files)
+
+            for base_name, pair_files in pairs.items():
+                pair_id = str(uuid.uuid4())
+                for filepath in pair_files:
+                    label = 1 if "_bad" in filepath.name.lower() else 0
+                    code = filepath.read_text(encoding='utf-8', errors='replace')
+
+                    sample = {
+                        "id": make_sample_id(),
+                        "source": "sard",
+                        "code": code,
+                        "label": label,
+                        "cwe": cwe,
+                        "language": "c",
+                        "collected_at": make_timestamp(),
+                        "pair_id": pair_id,
+                        "file_path": str(filepath),
+                    }
+                    self.save_sample(sample)
+
+    def _extract_cwe(self, dirname: str) -> str:
+        """'CWE120_Buffer_Copy' → 'CWE-120'"""
+        m = re.match(r'CWE(\d+)', dirname)
+        return f"CWE-{m.group(1)}" if m else ""
+
+    def _match_pairs(self, files: list[Path]) -> dict:
+        """Group _bad.c and _good.c files by base pair name."""
+        groups = defaultdict(list)
+        for f in files:
+            # Strip _bad/_good suffix to get pair key
+            base = re.sub(r'_(bad|good)\d*\.c$', '', f.name, flags=re.IGNORECASE)
+            groups[base].append(f)
+        return groups
+```
+
+### 3.3 CLI Interface
+
+```bash
+# Dry run (test with 20 samples)
+python training/scripts/collection/process_sard.py \
+    --sard-root data/raw/sard/ \
+    --output-dir training/data/raw/sard/ \
+    --dry-run --max-samples 20
+
+# Full run
+python training/scripts/collection/process_sard.py \
+    --sard-root data/raw/sard/ \
+    --output-dir training/data/raw/sard/
+```
+
+### Acceptance Criteria
+- [ ] Produces `sard_samples.jsonl` with 8K–12K samples
+- [ ] Every sample passes `validate_sample()`
+- [ ] Every `pair_id` links exactly 2 samples (1 bad, 1 good)
+- [ ] All 12 CWE types represented (at least 7 with ≥ 500 samples)
+- [ ] `--dry-run` processes 20 samples and exits
+
+### Production Issues
+| Issue | Impact | Fix |
+|-------|--------|-----|
+| SARD naming inconsistency | `_bad.c`, `_bad01.c`, `_bad_v2.c` all exist. Pair matching regex must handle all | Use loose regex: `re.sub(r'_(bad|good)\d*\.c$', ...)` |
+| SARD custom headers (`testcasesupport/`) | Files use `#include "std_testcase.h"` which doesn't exist locally | For M1, do NOT compile-check SARD files. They're pre-labeled by NIST |
+| Files >500 lines or <5 lines | Length filter in `validate_sample()` rejects them | Intentional — log skipped count. Expect ~15% rejection |
+| Non-UTF-8 encodings | Some old SARD files use Latin-1 | Use `chardet.detect()` → decode → re-encode as UTF-8 |
+| Some directories have only `_bad.c` (no `_good.c`) | No CFA pair → singleton sample | Set `pair_id = ""` for unpaired samples. They train with L_CE only (no L_CFA) |
+
+### Verification
+```bash
+# Count samples per CWE
+python -c "
+import json
+from collections import Counter
+samples = [json.loads(l) for l in open('training/data/raw/sard/sard_samples.jsonl')]
+print(f'Total: {len(samples)}')
+print(Counter(s['cwe'] for s in samples).most_common())
+# Check pair integrity
+pairs = {}
+for s in samples:
+    if s.get('pair_id'):
+        pairs.setdefault(s['pair_id'], []).append(s['label'])
+broken = [p for p,v in pairs.items() if sorted(v) != [0, 1]]
+print(f'Broken pairs: {len(broken)}')
+assert len(broken) == 0, 'CFA pair integrity violated!'
+"
+```
+
+---
+
+## Story 4: Preprocessing Stages 1–2 (Clean + Dedup)
+
+**Goal:** Normalize SARD code & remove duplicates.
+
+### 4.1 Stage 1: Clean & Normalize
+
+**File:** `training/scripts/preprocessing/stage1_clean.py`
+**Source:** `PREPROCESSING.md` §Stage 1
+
+```python
+# Key operations:
+# 1. tree-sitter C parser → validate function boundary (function_definition node)
+# 2. chardet encoding fix → UTF-8
+# 3. Remove comments: // and /* */
+# 4. Normalize blank lines (max 2 consecutive)
+# 5. Filter: 5 ≤ lines ≤ 500, 10 ≤ tokens ≤ 4096
+
+# Input:  training/data/raw/sard/sard_samples.jsonl
+# Output: training/data/processed/cleaned/samples.jsonl
+
+# CLI:
+python training/scripts/preprocessing/stage1_clean.py \
+    --input training/data/raw/sard/ \
+    --output training/data/processed/cleaned/samples.jsonl
+```
+
+### 4.2 Stage 2: Deduplicate
+
+**File:** `training/scripts/preprocessing/stage2_dedup.py`
+**Source:** `PREPROCESSING.md` §Stage 2
+
+```python
+# 4-level dedup (in order):
+# L1: MD5 exact hash (whitespace-normalized)
+# L2: CVE-ID dedup (no-op for SARD — no CVE IDs)
+# L3: Commit SHA dedup (no-op for SARD — no commits)
+# L4: MinHash LSH (Jaccard ≥ 0.85, 128 permutations, 4-gram character shingles)
+
+# Input:  training/data/processed/cleaned/samples.jsonl
+# Output: training/data/processed/deduped/samples.jsonl
+
+# CLI:
+python training/scripts/preprocessing/stage2_dedup.py \
+    --input training/data/processed/cleaned/samples.jsonl \
+    --output training/data/processed/deduped/samples.jsonl
+```
+
+### 4.3 Skip Stage 3 (CFA Generation) for M1
+
+SARD already has native `_bad.c` / `_good.c` CFA pairs via `pair_id`. Simply copy forward:
+```bash
+cp training/data/processed/deduped/samples.jsonl training/data/processed/with_cfa/samples.jsonl
+```
+
+### Acceptance Criteria
+- [ ] Stage 1 produces `cleaned/samples.jsonl` with all comments removed
+- [ ] Stage 1 rejects samples outside 5–500 lines
+- [ ] Stage 2 L1 removes exact duplicates
+- [ ] Stage 2 L4 removes near-duplicates (SARD has many copy-paste variants)
+- [ ] Expect 5–10% reduction from dedup
+- [ ] `pair_id` linkage survives both stages (pairs not broken)
+
+### Production Issues
+| Issue | Impact | Fix |
+|-------|--------|-----|
+| MinHash LSH memory (datasketch) | ~2GB for 12K samples with 128 permutations | Acceptable for M1; for M2 (40K+) process in 10K batches |
+| tree-sitter C parser fails on preprocessor directives | `#ifdef` blocks confuse parser | Remove `#ifdef` / `#endif` lines before parsing. Keep only the code inside. |
+| SARD files without function boundary | Some files are snippets, not complete functions | tree-sitter will fail to find `function_definition` → skip these samples |
+
+### Optimization
+```python
+# Stage 2 L4 optimization: use smaller num_perm for initial pass
+# If dataset < 15K samples: num_perm=128 (full accuracy)
+# If dataset > 40K samples: num_perm=64 (2x speed, <2% accuracy loss)
+num_perm = 64 if len(samples) > 40_000 else 128
+```
+
+---
+
+## Story 5: CPG Construction (Stage 4)
+
+**Goal:** Build 4-component Code Property Graph for each sample using Joern + Python TPG post-processor.
+
+**File:** `training/scripts/preprocessing/stage4_cpg.py`
+**Source:** `PREPROCESSING.md` §Stage 4 + `ARCHITECTURE.md` §3 + `NOVELTY.md` §N3
+
+### 5.1 Joern Script
+
+**File:** `training/scripts/preprocessing/joern_scripts/generate_cpg.sc`
+```scala
+@main def main(inputFile: String, outputDir: String) = {
+  importCode(inputFile)
+  run.ossdataflow    // CRITICAL — enables DFG edges
+  save
+
+  val nodesJson = cpg.graph.V.toJsonPretty
+  val edgesJson = cpg.graph.E.toJsonPretty
+
+  os.write(os.Path(outputDir) / "nodes.json", nodesJson)
+  os.write(os.Path(outputDir) / "edges.json", edgesJson)
+}
+```
+
+> [!WARNING]
+> Joern outputs CDG (Control Dependence Graph) edges alongside AST/CFG/DFG. CDG is NOT one of our 4 CPG components — the model uses `NUM_EDGE_TYPES = 4` (AST=0, CFG=1, DFG=2, TPG=3). **CDG edges must be filtered out** in `stage4_cpg.py` before building the graph, otherwise `edge_attr=4` will cause a CUDA index-out-of-bounds crash during training.
+> ```python
+> EDGE_TYPE_MAP = {"AST": 0, "CFG": 1, "DFG": 2, "TPG": 3}
+> edges = [e for e in joern_edges if e["type"] in EDGE_TYPE_MAP]
+> ```
+
+> [!CAUTION]
+> **`run.ossdataflow` is the #1 critical path** (from `CLAUDE.md` §Critical Paths). Without it, Joern produces AST+CFG only — no DFG. The GGNN loses all data-flow signal and F1 plateaus at ~0.70.
+
+### 5.2 TPG Post-Processor (Novel Component N3)
+
+**Source:** `NOVELTY.md` §N3
+
+```python
+# Taint role labeling
+SOURCES    = {"scanf","gets","fgets","getenv","recv","read","fread","getchar"}
+SINKS      = {"strcpy","strcat","system","popen","mysql_query","sprintf",
+              "printf","fprintf","execve","execl","execvp"}
+SANITIZERS = {"strncpy","strncat","snprintf","validate","sanitize",
+              "escape","filter","check"}
+
+# Algorithm:
+# 1. Label each node's taint_role based on called function name
+# 2. BFS from each SOURCE node to each SINK node along DFG edges
+# 3. If path exists AND does NOT pass through SANITIZER → add TPG edges
+# 4. Intermediate nodes become PROPAGATION
+
+# Edge types in final CPG (4 types — CDG is filtered out from Joern output):
+# AST=0, CFG=1, DFG=2, TPG=3
+```
+
+### 5.3 Context Slicing
+
+**Source:** `ARCHITECTURE.md` §3
+```python
+# Context slicing: 2-hop BFS from taint seeds → max 200 nodes
+# "Taint seeds" = all nodes with taint_role != NONE
+# If graph has > 200 nodes after slicing → keep only 200 highest-degree nodes
+# If graph has < 3 nodes → discard sample (trivial graph)
+```
+
+### 5.4 Pipeline per Sample
+
+```python
+def process_one_sample(sample: dict) -> dict | None:
+    # 1. Write code to temp .c file
+    # 2. Call Joern subprocess with 30-second timeout
+    # 3. Parse Joern output → nodes + edges (AST, CFG, DFG)
+    # 4. Label taint roles on nodes
+    # 5. Build TPG edges via BFS
+    # 6. Context slice → max 200 nodes
+    # 7. Validate: len(nodes) >= 3, DFG edges > 0
+    # 8. Return CPG dict → save to data/processed/cpg/{sample_id}.json
+```
+
+### Acceptance Criteria
+- [ ] Joern produces CPG with AST + CFG + DFG edges (≥3 edge types)
+- [ ] TPG post-processor adds TPG edges for samples with source→sink paths
+- [ ] Context slicing caps graphs at 200 nodes
+- [ ] At least 20% of samples have ≥1 taint node (source/sink) — for M1, `min_taint_coverage ≥ 0.20` (relaxed from 0.25 in `PREPROCESSING.md` to account for SARD's synthetic code patterns; aligned with Story 7 pre-training audit threshold)
+- [ ] Process rate ≥ 2 samples/second with 4 Joern workers
+
+### Production Issues
+| Issue | Impact | Fix |
+|-------|--------|-----|
+| Joern cold start ~3-5s per JVM | 12K samples × 4s = 13 hours of startup | Use Joern subprocess pool (4 pre-warmed processes). Or batch: all files in one directory, run Joern once |
+| Joern hangs on malformed C | Process blocks forever | `subprocess.run(..., timeout=30)`. Catch `TimeoutExpired`. Log to `cpg_failures.jsonl` |
+| Joern crashes on NIST headers | `#include "std_testcase.h"` causes parse error | Try auto-removing unknown includes before Joern. Accept 5–10% failure rate |
+| No DFG edges (run.ossdataflow missing) | GGNN data flow = zero signal | **Validate: count DFG edges in first 5 outputs. If 0, STOP and fix Joern script** |
+| TPG edges all zero (no taint nodes) | Novel N3 component contributes nothing | Expand SOURCES/SINKS sets with more SARD-specific function names. Verify taint coverage ≥25% |
+
+### Optimization
+```python
+# Joern batch mode: process entire directory at once
+# Instead of 1 subprocess per sample, write all samples to temp dir
+# and run Joern once on the directory
+import tempfile, subprocess
+
+def batch_joern(samples: list[dict], workers=4):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Write all .c files
+        for s in samples:
+            (Path(tmpdir) / f"{s['id']}.c").write_text(s['code'])
+        
+        # Run Joern on entire directory (single JVM startup)
+        subprocess.run([
+            JOERN_BIN, "--script", "generate_cpg.sc",
+            "--params", f"inputDir={tmpdir}"
+        ], timeout=len(samples) * 5)  # 5s per sample max
+```
+
+---
+
+## Story 6: Node Embedding + Graph Tensors (Stages 5–6)
+
+**Goal:** Create 824-d node feature vectors + PyG Data objects in HDF5.
+
+### 6.1 Stage 5: Node Embedding
+
+**File:** `training/scripts/preprocessing/stage5_embed.py`
+**Source:** `PREPROCESSING.md` §Stage 5 + `PRD.md` §7.4
+
+```python
+# 824-d node feature vector construction:
+# [0:768]   CodeBERT [CLS] of node's code statement (max 64 tokens)
+# [768:800] Node type one-hot (32 Joern node types)
+# [800:808] Taint role one-hot: source/sink/sanitizer/propagation/none + 3 reserved
+# [808:812] CPG component: AST=0, CFG=1, DFG=2, TPG=3 (4-d one-hot)
+# [812:824] Structural: in_degree, out_degree, AST_depth, taint_dist_to_sink × 3
+
+# IMPORTANT (PREPROCESSING.md):
+# - batch_size=64 for CodeBERT inference, NOT 1
+# - Each node's code statement is max 64 tokens (not 512)
+# - Empty code nodes → zero vector (do NOT skip)
+
+# Input:  data/processed/cpg/{sample_id}.json
+# Output: data/processed/embedded/{sample_id}.npz
+```
+
+### 6.2 Stage 6: Graph Tensors
+
+**File:** `training/scripts/preprocessing/stage6_graphs.py`
+**Source:** `PREPROCESSING.md` §Stage 6
+
+```python
+# PyG Data object assembly:
+# data.x          = (N, 824) float32   — node features
+# data.edge_index = (2, E)   int64     — edge connectivity
+# data.edge_attr  = (E,)     int64     — edge type {AST=0, CFG=1, DFG=2, TPG=3} (4 types only, CDG filtered out)
+# data.y          = (1,)     int64     — label
+# data.sample_id  = str
+# data.pair_id    = str                — empty if unpaired
+# data.cwe        = str
+
+# MANDATORY validation (from PREPROCESSING.md):
+assert data.num_nodes >= 3,             "trivial graph"
+assert data.edge_index.max() < data.num_nodes, "edge index OOB"
+assert not torch.isnan(data.x).any(),   "NaN in features"
+
+# Output: data/graphs/all_graphs.h5
+```
+
+### Acceptance Criteria
+- [ ] Each node has exactly 824 features
+- [ ] No NaN values in any feature vector
+- [ ] `edge_index.max() < num_nodes` for every graph
+- [ ] HDF5 file opens and loads in PyG DataLoader
+- [ ] Processing rate ≥ 10 samples/second on GPU (batch CodeBERT)
+
+### Production Issues
+| Issue | Impact | Fix |
+|-------|--------|-----|
+| CodeBERT GPU OOM on large batches | Crash during embedding | Use `batch_size=64` for nodes (not larger). On 8GB GPU, fits with AMP |
+| Empty code nodes in CPG | Zero-division in normalization | Use zero vector for empty nodes. Do NOT skip them — they're structural placeholders |
+| `edge_index` out of bounds | Silent CUDA crash during training | The `assert` in Stage 6 is **MANDATORY**. Also re-validate after `Batch.from_data_list()` |
+| HDF5 file corruption on crash | All graph data lost | Write to temp `.h5.tmp` → `os.replace()` after complete |
+
+### Optimization
+```python
+# AMP for CodeBERT node embedding (~2x speedup, ~40% less GPU memory)
+@torch.inference_mode()
+def embed_nodes_batch(model, tokenizer, statements, device, batch_size=64):
+    embeddings = []
+    for i in range(0, len(statements), batch_size):
+        batch = statements[i:i+batch_size]
+        inputs = tokenizer(batch, padding=True, truncation=True,
+                          max_length=64, return_tensors='pt').to(device)
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
+            out = model(**inputs).last_hidden_state[:, 0, :]
+        embeddings.append(out.float().cpu())
+    return torch.cat(embeddings)  # (N, 768)
+```
+
+---
+
+## Story 7: CFA-Aware Split + Pre-Training Audit (Stage 7)
+
+**Goal:** Split data into train/val/test with CFA pair integrity, verify quality gates.
+
+### 7.1 Stage 7: CFA-Aware Split
+
+**File:** `training/scripts/preprocessing/stage7_split.py`
+**Source:** `PREPROCESSING.md` §Stage 7
+
+```python
+# CRITICAL (from CLAUDE.md Rule 4: CFA Pairs Are Sacred):
+# 1. Group all samples by pair_id
+# 2. Shuffle GROUPS (not individual samples)
+# 3. Split groups 80/10/10 → train/val/test
+# 4. All members of a CFA pair go to SAME split
+# 5. Post-split assertion: zero commit SHA overlap between train and test
+
+# Input:  data/graphs/all_graphs.h5
+# Output: data/final/train.h5, data/final/val.h5, data/final/test.h5
+```
+
+### 7.2 Pre-Training Audit
+
+**File:** `training/scripts/preprocessing/pre_training_audit.py`
+**Source:** `PREPROCESSING.md` §Pre-Training Validation + `PRD.md` §6.3
+
+```python
+# For M1 (SARD-only), relax min_train_samples to 5,000
+# All other checks remain strict
+
+REQUIRED_CHECKS_M1 = {
+    "min_train_samples":    5_000,       # relaxed from 30K for SARD-only
+    "vuln_safe_balance":    (0.40, 0.60), # slightly relaxed for SARD
+    "cwe_diversity":        5,            # relaxed from 7 for SARD-only
+    "max_cwe_dominance":    0.40,         # slightly relaxed for SARD
+    "no_null_code":         0,
+    "test_train_no_overlap": 0,
+    "code_length_range":    (10, 4096),
+    "pair_integrity":       0,            # zero broken CFA pairs
+    "min_taint_coverage":   0.20,         # slightly relaxed for M1
+}
+```
+
+### Acceptance Criteria
+- [ ] train/val/test splits have no shared `pair_id`
+- [ ] No `pair_id` appears in more than one split
+- [ ] Pre-training audit passes all 9 checks (with M1-relaxed thresholds)
+- [ ] Label balance within (0.40, 0.60) in each split
+
+---
+
+## Story 8: Model + Training + Evaluation
+
+**Goal:** Implement StreamGuardModel, train Config B (no CFA) and C (with CFA), prove CFA works.
+
+### 8.1 StreamGuardModel
+
+**File:** `training/scripts/model/model.py`
+**Source:** `MODEL.md` §1 + `NOVELTY.md` §N3
+
+> [!IMPORTANT]
+> **Type-Aware GGNN (Option B):** The GGNN encoder MUST use per-edge-type message passing, NOT a single shared GatedGraphConv. This is required because N3 (TPG as 4th CPG component) is scientifically meaningless if the GNN cannot distinguish TPG edges from AST edges. A type-blind GNN treats `edge_attr` as decoration — TPG edges get folded into the same aggregation as AST structural edges, making the novel TPG component structurally present but semantically invisible.
+
+```python
+class StreamGuardModel(nn.Module):
+    """
+    CodeBERT + 3-layer Type-Aware GGNN + Cross-Attention Fusion
+    
+    Architecture:
+    - CodeBERT encoder: microsoft/codebert-base → [CLS] 768-d
+    - Node projector: Linear(node_feature_dim → 256)
+    - GGNN: 4 separate GatedGraphConv per layer (one per edge type)
+      × 3 layers = 12 GatedGraphConv modules total
+      Per layer: mask edges by type → 4 parallel convolutions
+      → concat(4 × 256 = 1024) → Linear(1024, 256) → BN → GELU → residual
+    - Readout: mean_pool + max_pool → 512 → 256-d
+    - Cross-attention: Q=BERT(768→256), K/V=GGNN(256) → attn 256-d
+    - Fused: concat(BERT_768, attn_256, GGNN_256) = 1280-d
+    - MLP: 1280 → LayerNorm → GELU → Dropout(0.3) → 512 → GELU → 128
+    - Heads: Binary(128,2), CWE(128,12), Severity(128,1)
+    """
+
+    NUM_EDGE_TYPES = 4    # AST=0, CFG=1, DFG=2, TPG=3
+    NUM_GGNN_LAYERS = 3
+    GGNN_HIDDEN = 256
+
+    def __init__(self, node_feature_dim=824, use_interproc=False, ...):
+        self.node_proj = nn.Linear(node_feature_dim, self.GGNN_HIDDEN)
+
+        # 4 separate GatedGraphConv per layer (4 types × 3 layers = 12 total)
+        self.edge_type_convs = nn.ModuleList([
+            nn.ModuleList([
+                GatedGraphConv(out_channels=self.GGNN_HIDDEN, num_layers=1)
+                for _ in range(self.NUM_EDGE_TYPES)
+            ])
+            for _ in range(self.NUM_GGNN_LAYERS)
+        ])
+
+        # Per-layer aggregation: concat 4 type outputs → 256
+        self.edge_agg = nn.ModuleList([
+            nn.Linear(self.GGNN_HIDDEN * self.NUM_EDGE_TYPES, self.GGNN_HIDDEN)
+            for _ in range(self.NUM_GGNN_LAYERS)
+        ])
+
+        self.ggnn_bn = nn.ModuleList([nn.BatchNorm1d(self.GGNN_HIDDEN) for _ in range(self.NUM_GGNN_LAYERS)])
+        self.ggnn_dropout = nn.Dropout(0.1)
+        # ... CodeBERT, cross-attention, MLP, heads same as before ...
+
+    def encode_graph(self, x, edge_index, edge_attr, batch):
+        h = self.node_proj(x)   # (N, 256)
+
+        for layer_idx in range(self.NUM_GGNN_LAYERS):
+            type_outputs = []
+            for etype in range(self.NUM_EDGE_TYPES):
+                mask = (edge_attr == etype)
+                ei_type = edge_index[:, mask]   # (2, E_type)
+                if ei_type.size(1) == 0:
+                    type_outputs.append(torch.zeros_like(h))  # no edges of this type
+                else:
+                    h_type = self.edge_type_convs[layer_idx][etype](h, ei_type)
+                    # Normalize by edge count so rare types (TPG) aren't drowned out
+                    count = max(mask.sum().item(), 1)
+                    type_outputs.append(h_type / (count ** 0.5))
+
+            h_concat = torch.cat(type_outputs, dim=-1)     # (N, 1024)
+            h_new = self.edge_agg[layer_idx](h_concat)     # (N, 256)
+            h_new = self.ggnn_bn[layer_idx](h_new)
+            h_new = F.gelu(h_new)
+            h_new = self.ggnn_dropout(h_new)
+            h = h + h_new if layer_idx > 0 else h_new      # residual from layer 2+
+
+        h_mean = global_mean_pool(h, batch)
+        h_max  = global_max_pool(h, batch)
+        h_graph = torch.cat([h_mean, h_max], dim=-1)       # (B, 512)
+        return self.graph_readout(h_graph)                  # (B, 256)
+```
+
+**Checkpoint config must include:**
+```python
+'config': {
+    'node_feature_dim': 824,
+    'use_ggnn': True,
+    'ggnn_type': 'per_edge_type_gated',   # ← distinguishes from type-blind
+    'cpg_components': ['AST','CFG','DFG','TPG'],
+    'num_edge_types': 4,
+    'use_cfa': use_cfa,
+    'use_interproc': False,
+    'num_cwe_classes': 12,
+}
+```
+
+**3 mandatory smoke tests (all must pass before moving to losses.py):**
+
+| Test | What It Verifies |
+|------|------------------|
+| Test 1: Forward pass | Batch of 4 graphs with all 4 edge types → correct output shapes |
+| Test 2: Edge type isolation | TPG-only graph vs AST-only graph → different embeddings (proves types are differentiated) |
+| Test 3: Missing edge types | Graph with only AST+CFG (no DFG/TPG) → no NaN, no crash |
+
+### 8.2 CFA Contrastive Loss
+
+**File:** `training/scripts/model/losses.py`
+**Source:** `MODEL.md` §2
+
+```python
+class StreamGuardLoss(nn.Module):
+    """
+    L_total = 1.0 * L_CE + 0.5 * L_CFA + 0.1 * L_severity
+    
+    L_CFA = mean(relu(cosine_sim(emb_v, emb_v') - (-margin)))
+    margin = 0.5
+    
+    Pushes vuln/safe paired embeddings to OPPOSITE sides of the embedding space.
+    """
+```
+
+### 8.3 CFA-Aware DataLoader
+
+**File:** `training/scripts/model/cfa_dataloader.py`
+**Source:** `MODEL.md` §3
+
+```python
+class CFAAwareBatchSampler:
+    """
+    CRITICAL (CLAUDE.md Rule 4 + MODEL.md §3):
+    Standard sampling splits CFA pairs across batches → contrastive loss
+    trains on random pairs → CFA contributes ZERO.
+    
+    Strategy:
+    1. Group samples by pair_id
+    2. Shuffle groups
+    3. Fill batches from groups (pairs stay together)
+    """
+```
+
+### 8.4 Training Configuration
+
+**Source:** `PRD.md` §7.3
+
+```python
+TRAINING_CONFIG_M1 = {
+    "base_model":            "microsoft/codebert-base",
+    "optimizer":             "AdamW",
+    "weight_decay":          0.01,
+    "lr_codebert":           2e-5,       # conservative for pre-trained
+    "lr_ggnn_fusion":        1e-4,       # faster for randomly-init
+    "warmup_ratio":          0.1,
+    "scheduler":             "linear_warmup_cosine",
+    "batch_size_graphs":     8,          # GPU memory limited
+    "gradient_accumulation": 4,          # effective batch = 32
+    "max_seq_len":           512,
+    "max_cpg_nodes":         200,
+    "epochs":                20,
+    "early_stopping_patience": 5,
+    "seed":                  42,
+    "type_aware_edges":   True,       # per-edge-type GatedGraphConv (Option B)
+}
+```
+
+### 8.5 Training Runs (CFA-GNN Proof)
+
+```bash
+# Config B: CodeBERT + GGNN, 3-CPG, NO CFA (baseline)
+python training/scripts/model/train.py \
+    --config B_plus_ggnn \
+    --train-h5 training/data/final/train.h5 \
+    --use-cfa false \
+    --epochs 20
+
+# Config C: CodeBERT + GGNN, 3-CPG, WITH CFA (proof)
+python training/scripts/model/train.py \
+    --config C_plus_cfa \
+    --train-h5 training/data/final/train.h5 \
+    --use-cfa true \
+    --epochs 20
+
+# Config D: + TPG (4-CPG + CFA) — tests N3 novelty
+python training/scripts/model/train.py \
+    --config D_plus_tpg \
+    --train-h5 training/data/final/train.h5 \
+    --use-cfa true \
+    --cpg-components AST,CFG,DFG,TPG \
+    --type-aware-edges true \
+    --epochs 20
+
+# Config D-blind: + TPG but type-BLIND (measures typed-edge contribution for paper)
+python training/scripts/model/train.py \
+    --config D_plus_tpg_blind \
+    --train-h5 training/data/final/train.h5 \
+    --use-cfa true \
+    --cpg-components AST,CFG,DFG,TPG \
+    --type-aware-edges false \
+    --epochs 20
+```
+
+### 8.6 Evaluation Metrics
+
+**Source:** `EXPERIMENTS.md` + `MODEL.md` §5
+
+```python
+# Standard metrics: F1, precision, recall, FPR, FNR
+# Novel metrics:
+# - pairwise_contrast_accuracy: P(correct_v) AND P(correct_v') for CFA pairs
+# - worst_group_f1: lowest F1 across CWE subgroups
+# - per_cwe_f1: {CWE-89: 0.xx, CWE-120: 0.xx, ...}
+```
+
+### 8.7 Expected M1 Results
+
+| Config | Expected F1 | Expected Pairwise Acc | What It Proves |
+|--------|-------------|----------------------|----------------|
+| B: No CFA | ~0.80 | N/A | Baseline performance |
+| C: + CFA | ~0.85–0.87 | ~0.80 | **CFA improves F1 by ≥3%** |
+| D: + TPG | ~0.87–0.89 | ~0.82 | **TPG adds incremental value** |
+
+**CFA proof is POSITIVE if Config C F1 > Config B F1 by ≥ 3 percentage points.**
+
+### Acceptance Criteria
+- [ ] `StreamGuardModel` forward pass works on dummy data (batch of 4 graphs with all 4 edge types)
+- [ ] Smoke Test 2 passes: TPG-only graph ≠ AST-only graph embeddings (edge types differentiated)
+- [ ] Smoke Test 3 passes: missing edge types (no DFG/TPG) → no NaN or crash
+- [ ] `StreamGuardLoss` computes `L_CE + L_CFA + L_severity` without NaN
+- [ ] `CFAAwareBatchSampler` keeps pairs in same batch (verify: print 5 batches, check pair_ids)
+- [ ] Config B trains to completion with early stopping
+- [ ] Config C trains with CFA loss component visible in MLflow
+- [ ] Config C F1 > Config B F1 by ≥ 3% → **CFA PROOF POSITIVE**
+- [ ] Checkpoint contains `ggnn_type: 'per_edge_type_gated'` in config dict
+
+### Production Issues
+| Issue | Impact | Fix |
+|-------|--------|-----|
+| CFA pairs split across batches | Contrastive loss = random noise | `CFAAwareBatchSampler` is MANDATORY. Test by printing pair_ids per batch |
+| CodeBERT LR too high | Catastrophic forgetting → F1 drops to ~0.50 | Differential LR: CodeBERT=2e-5, rest=1e-4. Verify with `print(optimizer.param_groups)` |
+| Gradient explosion | NaN loss after few epochs | `clip_grad_norm_(model.parameters(), 1.0)` after gradient accumulation |
+| GPU OOM on batch_size=8 | Training crashes | Reduce to batch_size=4, accumulation=8. Or enable gradient checkpointing on GGNN |
+| MLflow not logging | No experiment tracking → can't compare runs | Verify MLflow server is running before training. Fallback: CSV logging |
+| **Empty edge type mask crashes GatedGraphConv** | CUDA error or garbage output when a sample has 0 edges of a type (e.g. safe code → 0 TPG edges) | The `if ei_type.size(1) == 0: append zeros` branch is MANDATORY — most common crash point |
+| **4× GGNN memory during forward pass** | 4 convolutions per layer hold 4 intermediate tensors simultaneously. 200 nodes × 256-d × 4 types × 3 layers × batch 8 ≈ 20MB extra activations | Reduce batch_size to 4 + accumulation=8 if near GPU memory limit |
+| **AST edge dominance drowns TPG gradient** | AST edges ~70% of all edges in SARD → `edge_agg` Linear gradients dominated by AST, suppressing TPG/DFG learning | Per-type count normalization: `h_type / (count ** 0.5)` before concat (already in spec above) |
+| **Checkpoint missing `ggnn_type` field** | Serving layer can't distinguish type-aware vs type-blind model → loads wrong `encode_graph()` | Save `'ggnn_type': 'per_edge_type_gated'` in checkpoint config dict |
+
+### Optimization
+```python
+# 1. torch.compile for 10-20% speedup (PyTorch 2.2+)
+model = torch.compile(model, mode='reduce-overhead')
+
+# 2. AMP training (mixed precision)
+scaler = torch.cuda.amp.GradScaler()
+with torch.autocast(device_type='cuda', dtype=torch.float16):
+    out = model(data)
+    loss, _ = criterion(out, ...)
+scaler.scale(loss / grad_accum).backward()
+
+# 3. Pin memory for DataLoader
+dataloader = DataLoader(..., pin_memory=True, persistent_workers=True, num_workers=4)
+
+# 4. Freeze CodeBERT layers 0-8 (reduce trainable params by ~70%)
+for i, layer in enumerate(model.codebert.encoder.layer):
+    if i < 9:
+        for p in layer.parameters():
+            p.requires_grad = False
+
+# 5. GPU memory budget (8GB GPU):
+#    Model: ~600MB | Optimizer: ~1200MB | Batch data: ~400MB | CodeBERT activations: ~800MB
+#    With AMP: total ~3.4GB → fits in 4GB VRAM
+#    Without AMP: total ~6.8GB → needs 8GB VRAM
+```
+
+---
+
+## Verification Plan
+
+### Automated Tests
+
+| Test | Command | When |
+|------|---------|------|
+| Schema validation | `python -c "from training.scripts.collection.schema import validate_sample; s = {'id':'test','source':'sard','code':'void f(){int x=1;char y;if(x)y=2;}','label':1,'cwe':'CWE-120','language':'c','collected_at':'2026-01-01T00:00:00Z'}; ok,e = validate_sample(s); assert ok, e"` | After Story 2 |
+| SARD pair integrity | See Story 3 §Verification block | After Story 3 |
+| Edge index bounds | `python training/scripts/preprocessing/validate_graphs.py --h5 training/data/graphs/all_graphs.h5` | After Story 6 |
+| Pre-training audit | `python training/scripts/preprocessing/pre_training_audit.py --dataset training/data/final/ --m1` | After Story 7 |
+| Model smoke test | `python -c "from training.scripts.model.model import StreamGuardModel; import torch; from torch_geometric.data import Data, Batch; m=StreamGuardModel(); d=Data(x=torch.randn(10,824),edge_index=torch.randint(0,10,(2,20)),edge_attr=torch.zeros(20,dtype=torch.long),y=torch.tensor([1])); b=Batch.from_data_list([d]*4); out=m(b); print({k:v.shape for k,v in out.items()})"` | After Story 8.1 |
+| CFA batching test | Print 5 batches from `CFAAwareBatchSampler`, verify `pair_id` appears exactly 2× per batch | After Story 8.3 |
+| Training dry-run | `python training/scripts/model/train.py --epochs 1 --max-samples 100 --config C_plus_cfa` | After Story 8.4 |
+
+### Manual Verification (by user)
+
+1. Open `sard_samples.jsonl`, pick 5 random samples — verify `code` is valid C, `label` matches `_bad`/`_good`, `pair_id` links correct partners
+2. Open 3 CPG JSON files in `data/processed/cpg/` — verify all 4 edge types exist (AST, CFG, DFG, TPG), taint roles are populated
+3. After training Config B and Config C, open MLflow UI → compare val_F1 curves → Config C should be ≥3% higher
+4. Check MLflow for `L_CFA` metric — it should decrease over epochs in Config C (contrastive loss is learning)
+
+---
+
+## Summary: What M1 Proof Looks Like When Complete
+
+```
+✅ SARD data: 8K–12K samples in canonical JSONL with pair_ids
+✅ Preprocessing: Clean → Dedup → CPG (4-component) → Embed (824-d) → Graph (HDF5) → Split
+✅ Model: StreamGuardModel (CodeBERT + GGNN + cross-attention) compiles and trains
+✅ Config B (no CFA): F1 ~0.80 — baseline
+✅ Config C (CFA): F1 ~0.85+ — CFA PROOF POSITIVE (≥3% gain)
+✅ Config D (TPG): F1 ~0.87+ — TPG adds value (novelty N3 validated)
+✅ Pairwise accuracy ~0.80+ — CFA pairs are correctly separated
+✅ Ready to proceed to M2 (full data collection + 30K+ samples + ablation study)
+```
+
+---
+
+## APPENDIX: Forward-Compatibility Review
+
+> [!IMPORTANT]
+> **9 conflicts identified** between M1 (CFA-GNN Proof) design and M2+ features. Each requires a small preventive change NOW to avoid costly rework later. All fixes are backward-compatible — they don't change M1 behavior, only add extensibility hooks.
+
+---
+
+### Conflict 1: Schema Missing M2+ Fields
+
+**M2+ Feature:** Severity regression head (L_severity), cross-source dedup by commit SHA & CVE-ID, CFA tracking
+**Conflict:** If `schema.py` only has `{id, source, code, label, cwe, language, collected_at, pair_id, file_path}`, M2 collectors produce samples that fail validation, and the severity head trains on zeros.
+
+**Fix in Story 2 — add these fields with defaults:**
+```python
+# In validate_sample(), these are OPTIONAL for M1:
+OPTIONAL_FIELDS_WITH_DEFAULTS = {
+    "severity_score": 0.0,       # CVSS float, used by L_severity head
+    "commit_sha": "",            # for cross-source dedup in Stage 7
+    "cve_id": "",                # for cross-source dedup in Stage 2/7
+    "cfa_origin": "native",      # "native" (SARD pairs) | "llm_generated" (Stage 3)
+    "aliases": {},               # {cve: "...", ghsa: "...", osv: "..."}
+    "metadata": {},              # extensible catch-all
+}
+# validate_sample() sets defaults for missing optional fields
+# Rejects only if REQUIRED fields are missing
+```
+
+---
+
+### Conflict 2: Node Feature Dimension Hardcoded at 824
+
+**M2+ Feature:** Inter-procedural context injection (N5) — appends callee summary embeddings to node features.
+**Conflict:** If `node_proj = Linear(824, 256)` is hardcoded, adding inter-proc features requires re-processing ALL graph data.
+
+**Fix in Story 6 & 8 — parameterize `input_dim`:**
+```python
+# stage5_embed.py: save feature_dim in metadata
+metadata = {"feature_dim": 824, "version": "v1"}
+
+# model.py: read input_dim from config, not hardcoded
+class StreamGuardModel(nn.Module):
+    def __init__(self, node_feature_dim=824, ...):  # ← parameterized, not 824
+        self.node_proj = nn.Linear(node_feature_dim, 256)
+```
+
+---
+
+### Conflict 3: Model Missing Inter-Procedural Stub
+
+**M2+ Feature:** Config E ablation (`use_interproc=True`) from EXPERIMENTS.md
+**Conflict:** If `model.py` has no inter-proc pathway, adding it later requires restructuring `forward()`.
+
+**Fix in Story 8 — add no-op stub:**
+```python
+class StreamGuardModel(nn.Module):
+    def __init__(self, ..., use_interproc=False):
+        self.use_interproc = use_interproc
+        if use_interproc:
+            self.interproc_proj = nn.Linear(768, 256)  # callee summary projection
+    
+    def forward(self, data, callee_embeddings=None):
+        # ... existing dual encoder + fusion ...
+        
+        if self.use_interproc and callee_embeddings is not None:
+            interproc_feat = self.interproc_proj(callee_embeddings)
+            fused = torch.cat([fused, interproc_feat], dim=-1)
+            # Update MLP input_dim accordingly
+        
+        # In M1: use_interproc=False → this block is skipped entirely
+```
+
+---
+
+### Conflict 4: Split Logic Missing commit_sha / cve_id Grouping
+
+**M2+ Feature:** Cross-source data leakage prevention — same vulnerability (same commit/CVE) must be in same split.
+**Conflict:** If `stage7_split.py` only groups by `pair_id`, M2 data with commit SHAs will leak.
+
+**Fix in Story 7 — add secondary grouping (no-op for SARD):**
+```python
+def build_split_groups(samples):
+    """Group by: pair_id > commit_sha > cve_id > singleton"""
+    groups = {}
+    for s in samples:
+        # Priority: pair_id → commit_sha → cve_id → individual
+        group_key = s.get("pair_id") or s.get("commit_sha") or s.get("cve_id") or s["id"]
+        groups.setdefault(group_key, []).append(s)
+    return groups
+# For SARD: pair_id is set → groups by pair_id. commit_sha/cve_id are empty → ignored.
+# For M2: commit_sha/cve_id are populated → prevents cross-source leakage.
+```
+
+---
+
+### Conflict 5: Pipeline Stages with Hardcoded Paths
+
+**M2+ Feature:** Stage 3 (LLM CFA Generation) inserted between Stage 2 and Stage 4.
+**Conflict:** If Stage 4 hardcodes `input = "data/processed/deduped/samples.jsonl"`, inserting Stage 3 requires editing Stage 4.
+
+**Fix in Stories 4–7 — use `--input` / `--output` CLI args consistently:**
+```bash
+# Every stage takes explicit --input and --output
+python stage1_clean.py --input raw/sard/ --output processed/cleaned/
+python stage2_dedup.py --input processed/cleaned/ --output processed/deduped/
+# M1: cp processed/deduped/ → processed/with_cfa/  (skip Stage 3)
+# M2: python stage3_cfa.py --input processed/deduped/ --output processed/with_cfa/
+python stage4_cpg.py --input processed/with_cfa/ --output processed/cpg/
+# ... each stage reads from previous stage's output
+```
+
+---
+
+### Conflict 6: Checkpoint Format Missing Architecture Config
+
+**M2+ Feature:** Serving plane (`SERVING.md`) loads trained model for inference.
+**Conflict:** If checkpoints are just `torch.save(model.state_dict(), "best.pt")`, the serving layer can't reconstruct the model architecture.
+
+**Fix in Story 8 — save full config in checkpoint:**
+```python
+checkpoint = {
+    "model_state_dict": model.state_dict(),
+    "optimizer_state_dict": optimizer.state_dict(),
+    "epoch": epoch,
+    "best_f1": best_f1,
+    "config": {
+        "node_feature_dim": 824,
+        "use_ggnn": True,
+        "cpg_components": ["AST", "CFG", "DFG", "TPG"],
+        "use_cfa": True,
+        "use_interproc": False,
+        "num_cwe_classes": 12,
+        "ablation_config": "C_plus_cfa",
+    }
+}
+torch.save(checkpoint, "best_model.pt")
+# Serving: config = ckpt["config"]; model = StreamGuardModel(**config)
+```
+
+---
+
+### Conflict 7: Model Not Exposing Intermediate Representations
+
+**M2+ Feature:** CFExplainer (counterfactual explanations) needs GGNN layer outputs + attention weights.
+**Conflict:** If `forward()` returns only `{binary_logits, cwe_logits, severity}`, CFExplainer can't compute node importance.
+
+**Fix in Story 8 — add `return_intermediates` flag:**
+```python
+def forward(self, data, return_intermediates=False):
+    # ... normal forward ...
+    
+    outputs = {"binary_logits": ..., "cwe_logits": ..., "severity": ...}
+    
+    if return_intermediates:
+        outputs["fused_embedding"] = fused_128d      # for CFA contrastive loss
+        outputs["ggnn_node_embeddings"] = ggnn_h      # per-node, for CFExplainer
+        outputs["attention_weights"] = attn_weights   # for attribution analysis
+        outputs["bert_cls"] = bert_cls_768d           # for BERT-only baseline comparison
+    
+    return outputs
+# M1: return_intermediates=False → zero overhead
+# M2: CFExplainer calls with return_intermediates=True
+```
+
+---
+
+### Conflict 8: DataLoader Not Composable
+
+**M2+ Feature:** Curriculum learning (easy CWEs first, hard CWEs later), source-balanced sampling (equal representation across 7 sources).
+**Conflict:** If `CFAAwareBatchSampler` is monolithic, adding curriculum or source-balancing requires rewriting it.
+
+**Fix in Story 8 — design as composable layers:**
+```python
+class CFAAwareBatchSampler:
+    def __init__(self, dataset, batch_size,
+                 source_weights=None,      # M2: {"sard": 0.3, "repo": 0.4, ...}
+                 cwe_order=None,           # M2: curriculum ordering
+                 pair_first=True):         # Always True — pairs are sacred
+        self.pair_first = pair_first
+        self.source_weights = source_weights  # None in M1 → uniform
+        self.cwe_order = cwe_order            # None in M1 → random
+    
+    def __iter__(self):
+        groups = self._group_by_pair()
+        if self.cwe_order:
+            groups = self._sort_by_curriculum(groups)
+        if self.source_weights:
+            groups = self._resample_by_source(groups)
+        # ... batch from groups (pairs stay together)
+```
+
+---
+
+### Conflict 9: MLflow Experiment Naming
+
+**M2+ Feature:** Full ablation study with 5 configs × multiple seeds.
+**Conflict:** If M1 logs to default experiment, M2 results are mixed with M1 runs.
+
+**Fix in Story 8:**
+```python
+EXPERIMENT_NAME_M1 = "streamguard_m1_sard_proof"
+EXPERIMENT_NAME_M2 = "streamguard_m2_full_ablation"
+
+mlflow.set_experiment(EXPERIMENT_NAME_M1)
+with mlflow.start_run(run_name=f"{config_name}_seed{seed}"):
+    mlflow.log_params(TRAINING_CONFIG_M1)
+    # ...
+```
+
+---
+
+### Summary: Changes per Story
+
+| Story | Forward-Compat Changes | Effort |
+|-------|----------------------|--------|
+| **2: Schema** | Add 6 optional fields with defaults (`severity_score`, `commit_sha`, `cve_id`, `cfa_origin`, `aliases`, `metadata`) | +15 lines |
+| **4: Preprocessing** | Use `--input`/`--output` CLI args everywhere (no hardcoded paths) | +5 lines per stage |
+| **6: Embed/Graph** | Save `feature_dim` in HDF5 metadata | +3 lines |
+| **7: Split** | Add `commit_sha`/`cve_id` secondary grouping (no-op for SARD) | +10 lines |
+| **8: Model** | Add `use_interproc` stub, `return_intermediates` flag, parameterize `node_feature_dim`, save config in checkpoint, composable sampler, MLflow experiment naming | +40 lines |
+| **Total** | | **~75 extra lines** |
+
+> [!TIP]
+> These 75 lines of future-proofing save an estimated **2–3 days of rework** in M2 (reprocessing all HDF5 data, restructuring model forward pass, fixing data leakage bugs).
+
+---
+
+*CFA-GNN Proof Technical Plan | StreamGuard v2 | March 2026*

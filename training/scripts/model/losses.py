@@ -1,17 +1,19 @@
 # training/scripts/model/losses.py
 #
-# StreamGuardLoss: Composite multi-task loss for CFA-paired training.
+# Phase 4 StreamGuardLoss: Composite multi-task loss for CFA-paired training.
 #
-# L_total = λ_ce * L_CE  +  λ_cfa * L_CFA  +  λ_sev * L_severity
+# L_total = λ_ce  * L_CE
+#         + λ_cfa * L_CFA
+#         + 0.2   * L_CWE
+#         + λ_sev * L_severity
 #
-#   L_CE:       CrossEntropyLoss on binary_logits (vuln/safe)
-#   L_CFA:      Cosine-margin contrastive on CFA (vuln, safe) embedding pairs.
-#               sim = cosine_similarity(vuln_emb, safe_emb)
-#               L_CFA = mean(relu(sim + margin))   where margin=0.5
-#               Pushes paired embeddings to OPPOSITE sides of the embedding space.
-#               When no CFA pairs exist in batch (or use_cfa=False): L_CFA = 0.
-#   L_severity: MSELoss on severity head output vs severity_score label.
-#               Samples with severity < 0 (sentinel for "unknown") are masked out.
+# L_CE:       CrossEntropyLoss on binary logits (vuln/safe)
+# L_CFA:      Cosine-margin contrastive on CFA (vuln, safe) embedding pairs.
+#             CORRECT formula: relu(cosine_sim + margin) where margin=0.5
+#             WRONG formula:   relu(cosine_sim - margin) ← DO NOT USE
+#             R-02 mitigation: sign is critically verified in test_p4s4_losses.py
+# L_CWE:     CrossEntropyLoss(label_smoothing=0.1) on CWE head — auxiliary
+# L_severity: HuberLoss(delta=1.0) on severity head, -1 labels skipped (R-23)
 #
 # Research basis: VISION (Egea et al., AIES 2025) — paired GNN training with
 # contrastive objective. BCE alone allows spurious correlations; contrastive
@@ -22,16 +24,37 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CWE label mapping (12 target CWEs)
+# ─────────────────────────────────────────────────────────────────────────────
+
+CWE_LABEL_MAP = {
+    "CWE-89":  0,   # SQL Injection
+    "CWE-78":  1,   # OS Command Injection
+    "CWE-79":  2,   # Cross-Site Scripting
+    "CWE-119": 3,   # Buffer Overflow (general)
+    "CWE-120": 4,   # Buffer Copy No Bound Check
+    "CWE-121": 5,   # Stack Buffer Overflow
+    "CWE-122": 6,   # Heap Buffer Overflow
+    "CWE-125": 7,   # Out-of-Bounds Read
+    "CWE-134": 8,   # Uncontrolled Format String
+    "CWE-190": 9,   # Integer Overflow
+    "CWE-416": 10,  # Use After Free
+    "CWE-476": 11,  # NULL Pointer Dereference
+}
+
+# Reverse map for eval.py
+LABEL_CWE_MAP = {v: k for k, v in CWE_LABEL_MAP.items()}
+
+
 class StreamGuardLoss(nn.Module):
     """
     Composite loss for CFA-paired training.
 
-    L_total = λ_ce * L_CE + λ_cfa * L_CFA + λ_sev * L_severity
+    L_total = λ_ce * L_CE + λ_cfa * L_CFA + 0.2 * L_CWE + λ_sev * L_severity
 
-    forward(outputs, batch, use_cfa=True) -> (total_loss, loss_dict)
-
-    loss_dict always contains {L_total, L_CE, L_CFA, L_severity} so
-    MLflow can log each component separately, even when a component is 0.
+    forward(outputs_orig, outputs_cfa, labels, cwe_labels, severity_labels)
+        → (total_loss: Tensor, loss_dict: dict)
     """
 
     def __init__(
@@ -40,6 +63,8 @@ class StreamGuardLoss(nn.Module):
         lambda_cfa: float = 0.5,
         lambda_sev: float = 0.1,
         cfa_margin: float = 0.5,
+        num_cwe: int      = 12,
+        label_smoothing: float = 0.1,
     ):
         super().__init__()
         self.lambda_ce  = lambda_ce
@@ -48,156 +73,85 @@ class StreamGuardLoss(nn.Module):
         self.margin     = cfa_margin
 
         self.ce_loss  = nn.CrossEntropyLoss()
-        self.mse_loss = nn.MSELoss()
+        self.cwe_loss = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        self.sev_loss = nn.HuberLoss(delta=1.0)
 
     def forward(
         self,
-        outputs: dict,
-        batch,
-        use_cfa: bool = True,
+        outputs_orig,
+        outputs_cfa=None,
+        labels=None,
+        cwe_labels=None,
+        severity_labels=None,
     ):
         """
+        Compute composite loss. All components are optional except L_CE.
+
         Args:
-            outputs: dict from StreamGuardModel.forward(). Expected keys:
-                binary_logits  (B, 2)
-                severity       (B,)
-                embedding      (B, 128)  — used for CFA contrastive loss
-            batch: PyG Batch object. Expected attributes:
-                batch.y            (B,) int   — binary labels 0/1
-                batch.pair_id      list[str]  — CFA pair identifiers ('' = no pair)
-                batch.severity_score (B,) float — CVSS proxy (-1 = unknown), optional
-            use_cfa: if False, L_CFA is not computed (set to 0).
+            outputs_orig:    model output dict for original samples
+            outputs_cfa:     model output dict for CFA counterparts (None if no pairs)
+            labels:          (B,) int64 binary labels 0/1
+            cwe_labels:      (B,) int64 CWE class index 0-11 (None or -1 = unknown)
+            severity_labels: (B,) float severity 0-10 (-1 = unknown)
 
         Returns:
-            total_loss: scalar Tensor (differentiable)
-            loss_dict:  {L_total, L_CE, L_CFA, L_severity} — all float values
-                        for MLflow logging.
+            (total_loss: Tensor, loss_dict: dict of component values)
         """
-        device = outputs["binary_logits"].device
-        total  = torch.tensor(0.0, device=device)
+        losses = {}
+        device = outputs_orig["logits"].device
+        total  = torch.tensor(0.0, device=device, requires_grad=True)
 
-        # ── L_CE: binary classification ──────────────────────────────────
-        labels = batch.y.to(device)
-        l_ce   = self.ce_loss(outputs["binary_logits"], labels)
-        total  = total + self.lambda_ce * l_ce
+        # ── L_CE: Binary classification ──────────────────────────────────
+        if labels is not None:
+            l_ce = self.ce_loss(outputs_orig["logits"], labels.to(device))
+            losses["L_CE"] = l_ce.item()
+            total = total + self.lambda_ce * l_ce
 
-        # ── L_CFA: cosine-margin contrastive on CFA pairs ───────────────
-        l_cfa_val = 0.0
-        if use_cfa:
-            l_cfa = self._compute_cfa_loss(outputs, batch, device)
-            if l_cfa is not None:
-                total     = total + self.lambda_cfa * l_cfa
-                l_cfa_val = l_cfa.item()
-
-        # ── L_severity: MSE regression ───────────────────────────────────
-        # IMPORTANT (train.py must handle): SARD samples store severity_score=0.0
-        # in HDF5. Since 0.0 >= 0 passes valid_mask, the severity head would train
-        # 20 epochs learning to predict 0.0 for everything. In train.py, set
-        # severity_score = -1 for SARD data so this mask filters it out:
-        #   sev_labels[sev_labels == 0.0] = -1.0
-        # Or set lambda_sev=0.0 for M1 (no real CVSS scores available).
-        l_sev_val = 0.0
-        if hasattr(batch, "severity_score") and batch.severity_score is not None:
-            sev_labels = batch.severity_score.to(device).float()
-            valid_mask = sev_labels >= 0  # -1 sentinel = unknown
-            if valid_mask.any():
-                l_sev     = self.mse_loss(
-                    outputs["severity"][valid_mask],
-                    sev_labels[valid_mask],
+        # ── L_CWE: Multi-class CWE head (auxiliary, weight=0.2) ─────────
+        if cwe_labels is not None:
+            cwe_labels_dev = cwe_labels.to(device)
+            valid = (cwe_labels_dev >= 0) & (cwe_labels_dev < 12)
+            if valid.any():
+                l_cwe = self.cwe_loss(
+                    outputs_orig["cwe_logits"][valid],
+                    cwe_labels_dev[valid],
                 )
-                total     = total + self.lambda_sev * l_sev
-                l_sev_val = l_sev.item()
+                losses["L_CWE"] = l_cwe.item()
+                total = total + 0.2 * l_cwe
 
-        loss_dict = {
-            "L_total":    total.item(),
-            "L_CE":       l_ce.item(),
-            "L_CFA":      l_cfa_val,
-            "L_severity": l_sev_val,
-        }
-        return total, loss_dict
+        # ── L_CFA: Cosine margin contrastive on (v, v') pairs ───────────
+        # CRITICAL R-02: formula is relu(cosine_sim + margin), NOT minus
+        # margin = +0.5 → penalizes when cosine_sim > -0.5
+        # Goal: push vuln and CFA embeddings to OPPOSITE hemispheres
+        if outputs_cfa is not None:
+            emb_v  = outputs_orig["embedding"]
+            emb_vp = outputs_cfa["embedding"]
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Internal: CFA contrastive loss
-    # ──────────────────────────────────────────────────────────────────────
+            min_len = min(emb_v.size(0), emb_vp.size(0))
+            if min_len > 0:
+                emb_v  = emb_v[:min_len]
+                emb_vp = emb_vp[:min_len]
 
-    def _compute_cfa_loss(self, outputs, batch, device):
-        """
-        Extract CFA pairs from batch via pair_id, compute contrastive loss.
+                cosine_sim = F.cosine_similarity(emb_v, emb_vp, dim=-1)
+                l_cfa = F.relu(cosine_sim + self.margin).mean()
+                losses["L_CFA"] = l_cfa.item()
+                total = total + self.lambda_cfa * l_cfa
 
-        For each pair_id that appears exactly twice:
-          - vuln member  (label=1) embedding
-          - safe member  (label=0) embedding
-          sim = cosine_similarity(vuln_emb, safe_emb)
-          per-pair loss = relu(sim + margin)
-        L_CFA = mean over all pairs.
+                # Diagnostic: fraction of pairs already separated (sim < -margin)
+                losses["frac_separated"] = (cosine_sim < -self.margin).float().mean().item()
 
-        Returns None if no valid pairs found in this batch.
-        """
-        # pair_id can be a list (from Batch collation) or a tensor attribute
-        pair_ids = _get_pair_ids(batch)
-        if pair_ids is None:
-            return None
+        # ── L_severity: CVSS proxy regression (HuberLoss) ───────────────
+        # R-23 mitigation: skip samples where severity_label == -1
+        if severity_labels is not None:
+            sev_dev = severity_labels.to(device).float()
+            valid_mask = sev_dev >= 0
+            if valid_mask.any():
+                l_sev = self.sev_loss(
+                    outputs_orig["severity_score"][valid_mask],
+                    sev_dev[valid_mask],
+                )
+                losses["L_severity"] = l_sev.item()
+                total = total + self.lambda_sev * l_sev
 
-        labels    = batch.y.to(device)
-        embedding = outputs["embedding"]  # (B, 128)
-
-        # Group indices by pair_id, keep only groups of exactly 2
-        from collections import defaultdict
-        groups = defaultdict(list)
-        for idx, pid in enumerate(pair_ids):
-            if pid and pid not in ("", "None", "null", "0"):
-                groups[pid].append(idx)
-
-        vuln_embs = []
-        safe_embs = []
-        for pid, indices in groups.items():
-            if len(indices) != 2:
-                continue
-            i, j = indices
-            li, lj = labels[i].item(), labels[j].item()
-            # Identify vuln (1) and safe (0) member
-            if li == 1 and lj == 0:
-                vuln_embs.append(embedding[i])
-                safe_embs.append(embedding[j])
-            elif li == 0 and lj == 1:
-                vuln_embs.append(embedding[j])
-                safe_embs.append(embedding[i])
-            else:
-                # Both same label — malformed pair, skip silently
-                continue
-
-        if not vuln_embs:
-            return None
-
-        vuln_stack = torch.stack(vuln_embs)  # (P, 128)
-        safe_stack = torch.stack(safe_embs)  # (P, 128)
-
-        sim   = F.cosine_similarity(vuln_stack, safe_stack, dim=-1)  # (P,)
-        l_cfa = F.relu(sim + self.margin).mean()
-        return l_cfa
-
-
-def _get_pair_ids(batch) -> list | None:
-    """
-    Extract pair_id list from a PyG Batch.
-
-    PyG Batch collation handles string attributes by concatenating them
-    into a list. This helper normalises the various ways pair_id may
-    appear (list, tensor, or missing).
-    """
-    if not hasattr(batch, "pair_id"):
-        return None
-
-    pair_ids = batch.pair_id
-    if pair_ids is None:
-        return None
-
-    # PyG concatenates string attrs into a flat list
-    if isinstance(pair_ids, (list, tuple)):
-        return [str(p) for p in pair_ids]
-
-    # Tensor of ints/strings — convert
-    if isinstance(pair_ids, torch.Tensor):
-        return [str(p.item()) for p in pair_ids]
-
-    return None
+        losses["total"] = total.item()
+        return total, losses

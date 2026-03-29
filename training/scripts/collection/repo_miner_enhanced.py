@@ -1,570 +1,818 @@
-"""Enhanced Repository Miner for StreamGuard.
-
-Mines security-related commits from open-source repositories to extract
-vulnerable/fixed code pairs for training data.
+#!/usr/bin/env python3
 """
+training/scripts/collection/repo_miner_enhanced.py
 
+API-only repo miner for StreamGuard.
+Mines security-related commits from 15 high-value C repositories via
+the GitHub Commits API. NEVER uses git clone/fetch.
+
+Steps:
+  1. Paginate through commits for each target repo
+  2. Score commit messages using weighted keyword filter (PI-05)
+  3. Fetch full diff only for qualifying commits (score >= 2, no exclusions)
+  4. Extract before/after C code from modified .c/.h files
+  5. Save paired samples with shared pair_id
+  6. Cross-dedup against CVE, OSV, and GitHub Advisory datasets
+
+Source: docs/New Docs/DATA_PIPELINE.md §Collector 6: Repo Miner
+"""
+from __future__ import annotations
+
+import argparse
 import json
-import re
 import os
+import re
+import uuid
+from collections import Counter
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
-from datetime import datetime, timedelta
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import logging
 
-import git
-from git import Repo, GitCommandError
+from loguru import logger
 
-from base_collector import BaseCollector
-
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+try:
+    from .base_collector import BaseCollector
+    from .schema import VALID_CWE, make_sample_id, make_timestamp, validate_sample
+    from .cve_collector_enhanced import GitHubTokenRotator, GitHubDiffFetcher
+    from .exploitdb_collector import CWE_KEYWORD_MAP
+except ImportError:
+    from base_collector import BaseCollector
+    from schema import VALID_CWE, make_sample_id, make_timestamp, validate_sample
+    from cve_collector_enhanced import GitHubTokenRotator, GitHubDiffFetcher
+    from exploitdb_collector import CWE_KEYWORD_MAP
 
 
-class EnhancedRepoMiner(BaseCollector):
-    """Enhanced repository miner for security vulnerabilities."""
+# ── Target Repositories (process in this exact order) ─────────────────────
+REPOS = [
+    "openssl/openssl",
+    "curl/curl",
+    "nginx/nginx",
+    "FFmpeg/FFmpeg",
+    "php/php-src",
+    "sqlite/sqlite",
+    "libpng/libpng",
+    "madler/zlib",
+    "git/git",
+    "redis/redis",
+    "libuv/libuv",
+    "libevent/libevent",
+    "openldap/openldap",
+    "antirez/redis",
+    "torvalds/linux",  # ~3000 security commits — process LAST
+]
 
-    # Security-related keywords to identify relevant commits
-    SECURITY_KEYWORDS = [
-        "security", "vulnerability", "CVE", "SQL injection", "XSS", "CSRF",
-        "command injection", "RCE", "path traversal", "SSRF", "XXE",
-        "fix security", "authentication bypass", "deserialization",
-        "unsafe", "sanitize", "exploit", "malicious", "injection",
-        "buffer overflow", "privilege escalation", "information disclosure"
-    ]
+# ── Scored Keyword Filter (PI-05) ─────────────────────────────────────────
+HIGH_KEYWORDS = ["cve-", "security", "vulnerability", "vuln", "exploit"]
+MED_KEYWORDS = [
+    "overflow", "buffer", "heap", "stack", "use-after-free",
+    "null deref", "injection", "out of bounds", "oob", "sanitize",
+]
+LOW_KEYWORDS = ["fix", "patch", "bug", "issue", "crash", "error"]
+EXCLUSION_KEYWORDS = [
+    "typo", "whitespace", "formatting", "style", "copyright",
+    "license", "documentation", "docs", "comment only",
+]
 
-    # Repository configurations with target sample counts
-    REPOSITORIES = {
-        # Python repositories
-        "django/django": {"language": "python", "target": 3500},
-        "pallets/flask": {"language": "python", "target": 3000},
-        "sqlalchemy/sqlalchemy": {"language": "python", "target": 3000},
-        "psf/requests": {"language": "python", "target": 2500},
-        "tiangolo/fastapi": {"language": "python", "target": 2500},
-        "Pylons/pyramid": {"language": "python", "target": 2000},
+HIGH_WEIGHT = 3
+MED_WEIGHT = 2
+LOW_WEIGHT = 1
 
-        # JavaScript repositories
-        "expressjs/express": {"language": "javascript", "target": 3500},
-        "nodejs/node": {"language": "javascript", "target": 3500},
-        "koajs/koa": {"language": "javascript", "target": 2500},
-        "fastify/fastify": {"language": "javascript", "target": 2500},
-        "nestjs/nest": {"language": "javascript", "target": 2500},
-        "hapijs/hapi": {"language": "javascript", "target": 2000},
-    }
+# ── Diff Filter Thresholds ────────────────────────────────────────────────
+MIN_CHANGED_LINES = 5
+MAX_CHANGED_LINES = 150
+VALID_DIFF_EXTENSIONS = {".c", ".h"}
 
-    def __init__(self, output_dir: str = "data/raw/opensource", cache_enabled: bool = True):
-        """
-        Initialize Enhanced Repository Miner.
+# ── Checkpoint Interval ───────────────────────────────────────────────────
+CHECKPOINT_PAGE_INTERVAL = 10
 
-        Args:
-            output_dir: Directory to save collected data
-            cache_enabled: Whether to cache cloned repositories
-        """
-        super().__init__(output_dir, cache_enabled)
+GITHUB_API_BASE = "https://api.github.com"
 
-        # Create repos cache directory
-        self.repos_dir = Path(output_dir) / "repos"
-        self.repos_dir.mkdir(parents=True, exist_ok=True)
 
-        self.since_date = datetime.now() - timedelta(days=3*365)  # Last 3 years
-        self.all_samples = []
+class RepoMiner(BaseCollector):
+    """
+    API-only repo miner. Paginate commits, score messages, fetch diffs.
+    NEVER uses git clone/fetch — GitHub Commits API only.
+    """
 
-    def collect(self) -> List[Dict]:
-        """
-        Collect vulnerability samples from all repositories.
-
-        Returns:
-            List of collected samples
-        """
-        logger.info(f"Starting repository mining for {len(self.REPOSITORIES)} repositories")
-        logger.info(f"Target: ~20,000 samples total")
-        logger.info(f"Mining commits since: {self.since_date.strftime('%Y-%m-%d')}")
-
-        samples = self.mine_all_repositories()
-
-        logger.info(f"Total samples collected: {len(samples)}")
-
-        return samples
-
-    def mine_all_repositories(self) -> List[Dict]:
-        """
-        Mine all repositories using multiprocessing.
-
-        Returns:
-            List of all collected samples
-        """
-        all_samples = []
-
-        # Use ProcessPoolExecutor for parallel mining
-        with ProcessPoolExecutor(max_workers=4) as executor:
-            future_to_repo = {
-                executor.submit(
-                    self._mine_repository_wrapper,
-                    repo_name,
-                    config
-                ): repo_name
-                for repo_name, config in self.REPOSITORIES.items()
-            }
-
-            for future in as_completed(future_to_repo):
-                repo_name = future_to_repo[future]
-                try:
-                    samples = future.result()
-                    all_samples.extend(samples)
-                    logger.info(
-                        f"Completed {repo_name}: {len(samples)} samples "
-                        f"(Total: {len(all_samples)})"
-                    )
-                except Exception as e:
-                    logger.error(f"Error mining {repo_name}: {str(e)}")
-                    self.log_error(f"Failed to mine {repo_name}", {"error": str(e)})
-
-        # Deduplicate samples
-        logger.info("Deduplicating samples...")
-        all_samples = self.deduplicate_samples(all_samples, key="vulnerable_code")
-
-        logger.info(f"Final sample count after deduplication: {len(all_samples)}")
-
-        return all_samples
-
-    def _mine_repository_wrapper(self, repo_name: str, config: Dict) -> List[Dict]:
-        """
-        Wrapper for mine_repository to handle multiprocessing.
-
-        Args:
-            repo_name: Repository name (org/repo)
-            config: Repository configuration
-
-        Returns:
-            List of samples from this repository
-        """
-        try:
-            return self.mine_repository(repo_name, config)
-        except Exception as e:
-            logger.error(f"Error in wrapper for {repo_name}: {str(e)}")
-            return []
-
-    def mine_repository(self, repo_name: str, config: Dict) -> List[Dict]:
-        """
-        Mine a single repository for security-related commits.
-
-        Args:
-            repo_name: Repository name (org/repo)
-            config: Repository configuration with language and target count
-
-        Returns:
-            List of samples from this repository
-        """
-        logger.info(f"Mining repository: {repo_name}")
-
-        samples = []
-        target = config["target"]
-        language = config["language"]
-
-        try:
-            # Clone or open repository
-            repo = self._get_repository(repo_name)
-
-            # Find security-related commits
-            security_commits = self.find_security_commits(repo)
-            logger.info(f"{repo_name}: Found {len(security_commits)} security commits")
-
-            # Extract samples from commits
-            for commit in security_commits:
-                if len(samples) >= target:
-                    break
-
-                try:
-                    commit_samples = self.extract_from_commit(
-                        repo, commit, repo_name, language
-                    )
-                    samples.extend(commit_samples)
-
-                    if len(samples) % 100 == 0:
-                        logger.info(f"{repo_name}: Extracted {len(samples)}/{target} samples")
-
-                except Exception as e:
-                    logger.warning(f"Error extracting from commit {commit.hexsha[:8]}: {str(e)}")
-                    continue
-
-            logger.info(f"{repo_name}: Completed with {len(samples)} samples")
-
-        except Exception as e:
-            logger.error(f"Error mining repository {repo_name}: {str(e)}")
-            self.log_error(f"Failed to mine {repo_name}", {"error": str(e)})
-
-        return samples[:target]  # Limit to target count
-
-    def _get_repository(self, repo_name: str) -> Repo:
-        """
-        Get repository instance, cloning if necessary.
-
-        Args:
-            repo_name: Repository name (org/repo)
-
-        Returns:
-            GitPython Repo object
-        """
-        repo_path = self.repos_dir / repo_name.replace("/", "_")
-
-        if repo_path.exists():
-            logger.info(f"Using cached repository: {repo_path}")
-            try:
-                repo = Repo(repo_path)
-                # Try to pull latest changes
-                try:
-                    origin = repo.remotes.origin
-                    origin.pull()
-                    logger.info(f"Pulled latest changes for {repo_name}")
-                except Exception as e:
-                    logger.warning(f"Could not pull updates for {repo_name}: {str(e)}")
-                return repo
-            except Exception as e:
-                logger.warning(f"Could not open cached repo, re-cloning: {str(e)}")
-                # Remove corrupted repo and re-clone
-                import shutil
-                shutil.rmtree(repo_path)
-
-        # Clone repository
-        logger.info(f"Cloning repository: {repo_name}")
-        repo_url = f"https://github.com/{repo_name}.git"
-
-        try:
-            repo = Repo.clone_from(repo_url, repo_path, depth=None)
-            logger.info(f"Successfully cloned {repo_name}")
-            return repo
-        except GitCommandError as e:
-            logger.error(f"Failed to clone {repo_name}: {str(e)}")
-            raise
-
-    def find_security_commits(self, repo: Repo) -> List:
-        """
-        Find commits with security-related keywords in commit message.
-
-        Args:
-            repo: GitPython Repo object
-
-        Returns:
-            List of security-related commits
-        """
-        security_commits = []
-
-        try:
-            # Get all commits since the specified date
-            commits = list(repo.iter_commits(
-                'HEAD',
-                since=self.since_date.strftime('%Y-%m-%d')
-            ))
-
-            logger.info(f"Analyzing {len(commits)} commits for security keywords")
-
-            for commit in commits:
-                if self.is_security_commit(commit):
-                    security_commits.append(commit)
-
-        except Exception as e:
-            logger.error(f"Error finding security commits: {str(e)}")
-            raise
-
-        return security_commits
-
-    def is_security_commit(self, commit) -> bool:
-        """
-        Determine if a commit is security-related based on commit message.
-
-        Args:
-            commit: GitPython commit object
-
-        Returns:
-            True if commit appears to be security-related
-        """
-        commit_message = commit.message.lower()
-
-        # Check for security keywords
-        for keyword in self.SECURITY_KEYWORDS:
-            if keyword.lower() in commit_message:
-                return True
-
-        return False
-
-    def extract_from_commit(
+    def __init__(
         self,
-        repo: Repo,
-        commit,
-        repo_name: str,
-        language: str
-    ) -> List[Dict]:
-        """
-        Extract vulnerable/fixed code pairs from a commit diff.
+        output_dir: str,
+        checkpoint_dir: str | None = None,
+        github_tokens: list[str] | None = None,
+        dry_run: bool = False,
+        max_samples: int = 0,
+        repo_filter: str | None = None,
+        cve_samples_path: str | None = None,
+        osv_samples_path: str | None = None,
+        github_advisory_samples_path: str | None = None,
+    ):
+        super().__init__(
+            output_dir=output_dir,
+            checkpoint_dir=checkpoint_dir,
+            source_name="repo",
+        )
 
-        Args:
-            repo: GitPython Repo object
-            commit: Commit object
-            repo_name: Repository name
-            language: Programming language
+        # Resolve tokens from args or env
+        tokens = github_tokens or []
+        if not tokens:
+            multi = os.environ.get("GITHUB_TOKENS", "")
+            if multi:
+                tokens = [t.strip() for t in multi.split(",") if t.strip()]
+        if not tokens:
+            single = os.environ.get("GITHUB_TOKEN", "")
+            if single:
+                tokens = [t.strip() for t in single.split(",") if t.strip()]
 
-        Returns:
-            List of sample dictionaries
-        """
-        samples = []
+        if not tokens:
+            raise ValueError(
+                "No GitHub token provided. Set GITHUB_TOKEN or GITHUB_TOKENS env var, "
+                "or use --github-token CLI flag."
+            )
 
-        try:
-            # Get parent commit for comparison
-            if not commit.parents:
-                return samples  # Skip initial commits
+        self.rotator = GitHubTokenRotator(tokens)
+        self.dry_run = dry_run
+        self.max_samples = max_samples
+        self.repo_filter = repo_filter
 
-            parent = commit.parents[0]
+        # Cross-dedup SHA sets
+        self._dedup_shas: set[str] = set()
+        self._load_dedup_shas(cve_samples_path, osv_samples_path, github_advisory_samples_path)
 
-            # Get diff between parent and current commit
-            diffs = parent.diff(commit, create_patch=True)
+        # SHA normalization cache (short -> full)
+        self._sha_cache: dict[str, str] = {}
 
-            for diff in diffs:
-                # Skip if not a relevant file type
-                if not self._is_relevant_file(diff.a_path or diff.b_path, language):
-                    continue
+        # Counters
+        self.repos_completed = 0
+        self.commits_scored = 0
+        self.commits_fetched = 0
+        self.commits_skipped_score = 0
+        self.commits_skipped_exclusion = 0
+        self.commits_skipped_dedup = 0
+        self.commits_stale_404 = 0
+        self.files_qualifying = 0
+        self.files_rejected_ext = 0
+        self.files_rejected_status = 0
+        self.files_rejected_size = 0
+        self.pairs_saved = 0
+        self.cwe_counts: Counter = Counter()
+        self.label_counts: Counter = Counter()
+        self.repo_sample_counts: Counter = Counter()
 
-                # Skip binary files
-                if diff.diff is None or len(diff.diff) == 0:
-                    continue
+    # ── Cross-Dedup Loading ───────────────────────────────────────────
 
-                try:
-                    # Extract vulnerable and fixed code
-                    vulnerable_code, fixed_code = self._extract_code_from_diff(diff)
-
-                    if not vulnerable_code or not fixed_code:
-                        continue
-
-                    # Validate code quality
-                    if not self.validate_code(vulnerable_code) or not self.validate_code(fixed_code):
-                        continue
-
-                    # Extract vulnerability type
-                    vuln_type = self.extract_vulnerability_type(commit.message)
-
-                    # Create sample
-                    sample = {
-                        "vulnerable_code": vulnerable_code,
-                        "fixed_code": fixed_code,
-                        "commit_sha": commit.hexsha,
-                        "commit_message": commit.message.strip(),
-                        "repository": repo_name,
-                        "file_path": diff.b_path or diff.a_path,
-                        "vulnerability_type": vuln_type,
-                        "committed_date": commit.committed_datetime.isoformat(),
-                        "source": "opensource_repo",
-                        "language": language
-                    }
-
-                    samples.append(sample)
-                    self.samples_collected += 1
-
-                except Exception as e:
-                    logger.debug(f"Error extracting code from diff: {str(e)}")
-                    continue
-
-        except Exception as e:
-            logger.warning(f"Error processing commit {commit.hexsha[:8]}: {str(e)}")
-
-        return samples
-
-    def _is_relevant_file(self, file_path: Optional[str], language: str) -> bool:
-        """
-        Check if file is relevant for the given language.
-
-        Args:
-            file_path: Path to file
-            language: Programming language
-
-        Returns:
-            True if file is relevant
-        """
-        if not file_path:
-            return False
-
-        file_path = file_path.lower()
-
-        if language == "python":
-            return file_path.endswith('.py')
-        elif language == "javascript":
-            return file_path.endswith(('.js', '.ts', '.jsx', '.tsx'))
-
-        return False
-
-    def _extract_code_from_diff(self, diff) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Extract vulnerable and fixed code from a diff.
-
-        Args:
-            diff: GitPython diff object
-
-        Returns:
-            Tuple of (vulnerable_code, fixed_code)
-        """
-        try:
-            diff_text = diff.diff.decode('utf-8', errors='ignore')
-        except Exception:
-            return None, None
-
-        # Parse diff to extract removed and added lines
-        removed_lines = []
-        added_lines = []
-        context_lines = []
-
-        lines = diff_text.split('\n')
-        for line in lines:
-            if line.startswith('---') or line.startswith('+++'):
-                continue
-            elif line.startswith('@@'):
-                continue
-            elif line.startswith('-'):
-                removed_lines.append(line[1:])
-            elif line.startswith('+'):
-                added_lines.append(line[1:])
-            elif line.startswith(' '):
-                context_lines.append(line[1:])
-
-        # Build vulnerable code (with removed lines)
-        vulnerable_code = self._build_code_snippet(context_lines, removed_lines, added_lines, use_removed=True)
-
-        # Build fixed code (with added lines)
-        fixed_code = self._build_code_snippet(context_lines, removed_lines, added_lines, use_removed=False)
-
-        return vulnerable_code, fixed_code
-
-    def _build_code_snippet(
+    def _load_dedup_shas(
         self,
-        context_lines: List[str],
-        removed_lines: List[str],
-        added_lines: List[str],
-        use_removed: bool
-    ) -> Optional[str]:
+        cve_path: str | None,
+        osv_path: str | None,
+        advisory_path: str | None,
+    ) -> None:
+        """Load commit_sha sets from CVE, OSV, and GitHub Advisory samples for cross-dedup."""
+        default_base = Path(__file__).parent / "data" / "raw"
+        paths = {
+            "cve": Path(cve_path) if cve_path else default_base / "cve" / "cve_samples.jsonl",
+            "osv": Path(osv_path) if osv_path else default_base / "osv" / "osv_samples.jsonl",
+            "github_advisory": (
+                Path(advisory_path) if advisory_path
+                else default_base / "github_advisory" / "github_advisory_samples.jsonl"
+            ),
+        }
+
+        for source_name, path in paths.items():
+            if not path.exists():
+                logger.debug(f"Cross-dedup: {source_name} file not found at {path}")
+                continue
+            count = 0
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        sha = json.loads(line).get("commit_sha", "")
+                        if sha and len(sha) >= 7:
+                            self._dedup_shas.add(sha)
+                            count += 1
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+            logger.info(f"Cross-dedup: loaded {count} SHAs from {source_name}")
+
+        logger.info(f"Cross-dedup: {len(self._dedup_shas)} unique SHAs total")
+
+    # ── Scored Keyword Filter (PI-05) ─────────────────────────────────
+
+    @staticmethod
+    def score_commit_message(message: str) -> tuple[int, bool]:
         """
-        Build code snippet from diff components.
-
-        Args:
-            context_lines: Context lines from diff
-            removed_lines: Removed lines
-            added_lines: Added lines
-            use_removed: If True, use removed lines; else use added lines
-
-        Returns:
-            Code snippet or None
+        Score a commit message for security relevance.
+        Returns (score, has_exclusion).
         """
-        if use_removed:
-            target_lines = removed_lines
-        else:
-            target_lines = added_lines
+        msg_lower = message.lower()
 
-        if not target_lines:
+        # Check exclusions first
+        for excl in EXCLUSION_KEYWORDS:
+            if excl in msg_lower:
+                return 0, True
+
+        score = 0
+        for kw in HIGH_KEYWORDS:
+            if kw in msg_lower:
+                score += HIGH_WEIGHT
+        for kw in MED_KEYWORDS:
+            if kw in msg_lower:
+                score += MED_WEIGHT
+        for kw in LOW_KEYWORDS:
+            if kw in msg_lower:
+                score += LOW_WEIGHT
+
+        return score, False
+
+    # ── CWE Inference ─────────────────────────────────────────────────
+
+    @staticmethod
+    def infer_cwe(message: str) -> str | None:
+        """
+        Infer CWE from commit message using same priority-ordered map as ExploitDB.
+        Also checks for explicit CWE mentions.
+        """
+        msg_lower = message.lower()
+
+        # Check for explicit CWE mention first (e.g., "CWE-121")
+        cwe_match = re.search(r"cwe-(\d+)", msg_lower)
+        if cwe_match:
+            cwe_id = f"CWE-{cwe_match.group(1)}"
+            if cwe_id in VALID_CWE:
+                return cwe_id
+
+        # Fall back to keyword inference (reuses ExploitDB map)
+        for cwe, keywords in CWE_KEYWORD_MAP:
+            for kw in keywords:
+                if kw.lower() in msg_lower:
+                    return cwe
+
+        # Additional repo-miner-specific patterns
+        extra_patterns = [
+            ("CWE-119", ["memory corruption", "out-of-bounds write", "oob write"]),
+            ("CWE-125", ["out-of-bounds read", "oob read", "read overflow"]),
+        ]
+        for cwe, patterns in extra_patterns:
+            for p in patterns:
+                if p in msg_lower:
+                    return cwe
+
+        return None
+
+    # ── SHA Normalization (PI-06) ─────────────────────────────────────
+
+    def _resolve_full_sha(self, owner: str, repo: str, short_sha: str) -> str | None:
+        """Resolve short SHA to full 40-char via GitHub API. Caches results."""
+        if len(short_sha) >= 40:
+            return short_sha
+
+        cache_key = f"{owner}/{repo}/{short_sha}"
+        if cache_key in self._sha_cache:
+            return self._sha_cache[cache_key]
+
+        self.rotator.rotate_if_needed()
+        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/commits/{short_sha}"
+
+        try:
+            resp = self.safe_get(url, headers=self.rotator.auth_headers)
+            self.rotator.update_limits(dict(resp.headers))
+
+            if resp.status_code == 200:
+                full_sha = resp.json().get("sha", short_sha)
+                self._sha_cache[cache_key] = full_sha
+                return full_sha
+            return None
+        except Exception as e:
+            logger.debug(f"SHA resolution failed for {short_sha}: {e}")
             return None
 
-        # Combine context and target lines
-        # Take some context before and after
-        code_lines = []
+    # ── Commit Listing (Paginated) ────────────────────────────────────
 
-        # Add context
-        if context_lines:
-            code_lines.extend(context_lines[:5])  # First 5 context lines
-
-        # Add target lines
-        code_lines.extend(target_lines)
-
-        # Add more context
-        if context_lines:
-            code_lines.extend(context_lines[-5:])  # Last 5 context lines
-
-        code = '\n'.join(code_lines).strip()
-
-        return code if code else None
-
-    def save_samples_to_file(self, samples: List[Dict], filename: str = "mined_samples.jsonl"):
+    def _list_commits(self, owner: str, repo: str, page: int) -> list[dict] | None:
         """
-        Save collected samples to JSONL file.
-
-        Args:
-            samples: List of sample dictionaries
-            filename: Output filename
+        Fetch one page of commits from GitHub Commits API.
+        GET /repos/{owner}/{repo}/commits?per_page=100&page={n}
+        Returns list of commit dicts or None on failure.
         """
-        output_path = self.save_samples(samples, filename)
-        logger.info(f"Saved {len(samples)} samples to {output_path}")
+        self.rotator.rotate_if_needed()
+        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/commits"
+        params = {"per_page": 100, "page": page}
 
-        # Also save statistics
-        stats = self.get_stats()
-        stats["total_samples"] = len(samples)
-        stats["repositories"] = len(self.REPOSITORIES)
+        try:
+            resp = self.safe_get(url, headers=self.rotator.auth_headers, params=params)
+            self.rotator.update_limits(dict(resp.headers))
 
-        # Count samples by repository
-        repo_counts = {}
-        for sample in samples:
-            repo = sample.get("repository", "unknown")
-            repo_counts[repo] = repo_counts.get(repo, 0) + 1
-        stats["samples_per_repo"] = repo_counts
+            if resp.status_code == 409:
+                # Empty repository
+                logger.warning(f"{owner}/{repo}: empty repository (409)")
+                return []
+            if resp.status_code != 200:
+                logger.warning(f"{owner}/{repo} page {page}: HTTP {resp.status_code}")
+                return None
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Failed to list commits for {owner}/{repo} page {page}: {e}")
+            return None
 
-        # Count samples by vulnerability type
-        vuln_counts = {}
-        for sample in samples:
-            vuln = sample.get("vulnerability_type", "unknown")
-            vuln_counts[vuln] = vuln_counts.get(vuln, 0) + 1
-        stats["samples_per_vulnerability"] = vuln_counts
+    # ── Commit Detail Fetch ───────────────────────────────────────────
 
-        stats_file = self.output_dir / f"{Path(filename).stem}_stats.json"
-        with open(stats_file, 'w', encoding='utf-8') as f:
-            json.dump(stats, f, indent=2, ensure_ascii=False)
+    def _fetch_commit(self, owner: str, repo: str, sha: str) -> dict | None:
+        """Fetch a single commit's detail (including file diffs)."""
+        self.rotator.rotate_if_needed()
+        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/commits/{sha}"
 
-        logger.info(f"Saved statistics to {stats_file}")
+        try:
+            resp = self.safe_get(url, headers=self.rotator.auth_headers)
+            self.rotator.update_limits(dict(resp.headers))
+
+            if resp.status_code == 404:
+                return None
+            if resp.status_code != 200:
+                logger.warning(f"GitHub returned {resp.status_code} for {owner}/{repo}/{sha}")
+                return None
+            return resp.json()
+        except Exception as e:
+            logger.error(f"GitHub fetch failed for {owner}/{repo}/{sha}: {e}")
+            return None
+
+    # ── File Qualification ────────────────────────────────────────────
+
+    @staticmethod
+    def is_qualifying_file(file_info: dict) -> tuple[bool, str]:
+        """
+        Check if a diff file qualifies for extraction.
+        Returns (qualifies, rejection_reason).
+        """
+        filename = file_info.get("filename", "")
+        status = file_info.get("status", "")
+        patch = file_info.get("patch", "")
+
+        # Extension check
+        ext = "." + filename.rsplit(".", 1)[-1] if "." in filename else ""
+        if ext.lower() not in VALID_DIFF_EXTENSIONS:
+            return False, "extension"
+
+        # Status check — only modified files
+        if status != "modified":
+            return False, "status"
+
+        # Patch must exist
+        if not patch:
+            return False, "no_patch"
+
+        # Changed lines check
+        changed = GitHubDiffFetcher.count_changed_lines(patch)
+        if changed < MIN_CHANGED_LINES or changed > MAX_CHANGED_LINES:
+            return False, "size"
+
+        return True, ""
+
+    # ── Main Collection ───────────────────────────────────────────────
+
+    def collect(self) -> dict:
+        """
+        Mine all target repos in order. Returns summary dict.
+        """
+        if self.dry_run:
+            logger.info("DRY RUN MODE — will process but not save samples")
+
+        # Determine repos to process
+        repos = REPOS
+        if self.repo_filter:
+            if self.repo_filter not in REPOS:
+                logger.warning(
+                    f"--repo-filter '{self.repo_filter}' not in REPOS list. "
+                    f"Processing it anyway."
+                )
+            repos = [self.repo_filter]
+
+        # Load checkpoint
+        checkpoint = self.load_checkpoint()
+        repo_status: dict = checkpoint.get("repo_status", {})
+        repo_page: dict = checkpoint.get("repo_page", {})
+        done_shas: set[str] = set(checkpoint.get("done_shas", []))
+
+        if done_shas:
+            logger.info(f"Checkpoint: {len(done_shas)} commits already processed")
+
+        for repo_name in repos:
+            if self.max_samples > 0 and self._samples_saved >= self.max_samples:
+                logger.info(f"Reached max_samples ({self.max_samples}). Stopping.")
+                break
+
+            # Skip completed repos
+            if repo_status.get(repo_name) == "complete":
+                logger.info(f"Skipping {repo_name} (already complete)")
+                self.repos_completed += 1
+                continue
+
+            logger.info(f"Starting repo: {repo_name}")
+            repo_status[repo_name] = "in_progress"
+
+            owner, repo = repo_name.split("/")
+            start_page = repo_page.get(repo_name, 1)
+
+            self._mine_repo(
+                owner, repo, repo_name, start_page,
+                done_shas, repo_status, repo_page,
+            )
+
+            repo_status[repo_name] = "complete"
+            self.repos_completed += 1
+
+            # Checkpoint after each repo
+            self._save_full_checkpoint(repo_status, repo_page, done_shas)
+            logger.info(
+                f"Completed {repo_name}. "
+                f"Total samples: {self._samples_saved}, pairs: {self.pairs_saved}"
+            )
+
+        # Final checkpoint
+        self._save_full_checkpoint(repo_status, repo_page, done_shas)
+
+        # Finalize orphan pairs
+        if not self.dry_run:
+            orphans = self.finalize_pairs()
+            if orphans:
+                logger.info(f"Cleared {orphans} orphan pair_ids")
+
+        return self._build_summary()
+
+    def _mine_repo(
+        self,
+        owner: str,
+        repo: str,
+        repo_name: str,
+        start_page: int,
+        done_shas: set[str],
+        repo_status: dict,
+        repo_page: dict,
+    ) -> None:
+        """Paginate through commits for a single repo."""
+        page = start_page
+        consecutive_empty = 0
+
+        while True:
+            if self.max_samples > 0 and self._samples_saved >= self.max_samples:
+                break
+
+            commits = self._list_commits(owner, repo, page)
+            if commits is None:
+                # API error — skip page, try next
+                logger.warning(f"{repo_name} page {page}: API error, skipping")
+                page += 1
+                consecutive_empty += 1
+                if consecutive_empty >= 5:
+                    logger.warning(f"{repo_name}: 5 consecutive empty/error pages, stopping")
+                    break
+                continue
+
+            if not commits:
+                # No more commits
+                break
+
+            consecutive_empty = 0
+
+            for commit_entry in commits:
+                if self.max_samples > 0 and self._samples_saved >= self.max_samples:
+                    break
+
+                sha = commit_entry.get("sha", "")
+                message = commit_entry.get("commit", {}).get("message", "")
+
+                # SHA normalization
+                if sha and len(sha) < 40:
+                    full_sha = self._resolve_full_sha(owner, repo, sha)
+                    if full_sha:
+                        sha = full_sha
+
+                # Skip already-processed commits
+                if sha in done_shas:
+                    continue
+
+                # Skip cross-dedup
+                if sha in self._dedup_shas:
+                    self.commits_skipped_dedup += 1
+                    done_shas.add(sha)
+                    continue
+
+                # Score the commit message
+                score, has_exclusion = self.score_commit_message(message)
+                self.commits_scored += 1
+
+                if has_exclusion:
+                    self.commits_skipped_exclusion += 1
+                    done_shas.add(sha)
+                    continue
+
+                if score < 2:
+                    self.commits_skipped_score += 1
+                    done_shas.add(sha)
+                    continue
+
+                # Qualifying commit — fetch full diff
+                self._process_commit(owner, repo, repo_name, sha, message, done_shas)
+                done_shas.add(sha)
+
+                # Jitter between commit fetches
+                self.jitter_sleep(0.05)
+
+            page += 1
+
+            # Checkpoint every CHECKPOINT_PAGE_INTERVAL pages
+            if page % CHECKPOINT_PAGE_INTERVAL == 0:
+                repo_page[repo_name] = page
+                self._save_full_checkpoint(repo_status, repo_page, done_shas)
+                logger.info(
+                    f"{repo_name} page {page}: "
+                    f"scored={self.commits_scored}, "
+                    f"fetched={self.commits_fetched}, "
+                    f"saved={self._samples_saved}"
+                )
+
+        # Record last page for this repo
+        repo_page[repo_name] = page
+
+    def _process_commit(
+        self,
+        owner: str,
+        repo: str,
+        repo_name: str,
+        sha: str,
+        message: str,
+        done_shas: set[str],
+    ) -> None:
+        """Fetch commit diff, extract C code, save paired samples."""
+        commit_data = self._fetch_commit(owner, repo, sha)
+        if commit_data is None:
+            self.commits_stale_404 += 1
+            return
+
+        self.commits_fetched += 1
+
+        # Infer CWE from commit message
+        cwe = self.infer_cwe(message)
+        if not cwe:
+            # No CWE inferable — skip this commit
+            return
+
+        files = commit_data.get("files", [])
+        for file_info in files:
+            if self.max_samples > 0 and self._samples_saved >= self.max_samples:
+                break
+
+            qualifies, reason = self.is_qualifying_file(file_info)
+            if not qualifies:
+                if reason == "extension":
+                    self.files_rejected_ext += 1
+                elif reason == "status":
+                    self.files_rejected_status += 1
+                elif reason == "size":
+                    self.files_rejected_size += 1
+                continue
+
+            self.files_qualifying += 1
+            patch = file_info.get("patch", "")
+            filename = file_info.get("filename", "")
+
+            before_code, after_code = GitHubDiffFetcher.extract_before_after(patch)
+
+            # Create paired samples
+            timestamp = make_timestamp()
+            pair_id = str(uuid.uuid4())
+
+            vuln_sample = {
+                "id": make_sample_id(),
+                "source": "repo",
+                "code": before_code,
+                "label": 1,
+                "cwe": cwe,
+                "language": "c",
+                "collected_at": timestamp,
+                "pair_id": pair_id,
+                "commit_sha": sha,
+                "file_path": filename,
+                "cfa_origin": "native",
+                "metadata": {
+                    "repo_name": repo_name,
+                    "commit_message": message[:500],
+                    "cwe_confidence": "tier3_inferred",
+                },
+            }
+
+            fixed_sample = {
+                "id": make_sample_id(),
+                "source": "repo",
+                "code": after_code,
+                "label": 0,
+                "cwe": cwe,
+                "language": "c",
+                "collected_at": timestamp,
+                "pair_id": pair_id,
+                "commit_sha": sha,
+                "file_path": filename,
+                "cfa_origin": "native",
+                "metadata": {
+                    "repo_name": repo_name,
+                    "commit_message": message[:500],
+                    "cwe_confidence": "tier3_inferred",
+                },
+            }
+
+            # Validate both samples
+            vuln_valid, vuln_errors = validate_sample(vuln_sample)
+            fixed_valid, fixed_errors = validate_sample(fixed_sample)
+
+            if not vuln_valid or not fixed_valid:
+                self._samples_failed += 2
+                if not self.dry_run:
+                    if not vuln_valid:
+                        self.save_failed_item(vuln_sample, reason=str(vuln_errors))
+                    if not fixed_valid:
+                        self.save_failed_item(fixed_sample, reason=str(fixed_errors))
+                continue
+
+            # Save pair
+            if self.dry_run:
+                self._samples_saved += 2
+                self.pairs_saved += 1
+                self.cwe_counts[cwe] += 2
+                self.label_counts[1] += 1
+                self.label_counts[0] += 1
+            else:
+                saved_vuln = self.save_sample(vuln_sample)
+                saved_fixed = self.save_sample(fixed_sample)
+                if saved_vuln and saved_fixed:
+                    self.pairs_saved += 1
+                if saved_vuln:
+                    self.cwe_counts[cwe] += 1
+                    self.label_counts[1] += 1
+                    self.repo_sample_counts[repo_name] += 1
+                if saved_fixed:
+                    self.cwe_counts[cwe] += 1
+                    self.label_counts[0] += 1
+                    self.repo_sample_counts[repo_name] += 1
+
+    # ── Checkpoint Helpers ────────────────────────────────────────────
+
+    def _save_full_checkpoint(
+        self,
+        repo_status: dict,
+        repo_page: dict,
+        done_shas: set[str],
+    ) -> None:
+        """Save full checkpoint state."""
+        self.save_checkpoint({
+            "repo_status": repo_status,
+            "repo_page": repo_page,
+            "done_shas": list(done_shas),
+            "total_saved": self._samples_saved,
+        })
+
+    # ── Summary ───────────────────────────────────────────────────────
+
+    def _build_summary(self) -> dict:
+        return {
+            "repos_completed": self.repos_completed,
+            "commits_scored": self.commits_scored,
+            "commits_fetched": self.commits_fetched,
+            "commits_skipped_score": self.commits_skipped_score,
+            "commits_skipped_exclusion": self.commits_skipped_exclusion,
+            "commits_skipped_dedup": self.commits_skipped_dedup,
+            "commits_stale_404": self.commits_stale_404,
+            "files_qualifying": self.files_qualifying,
+            "files_rejected_ext": self.files_rejected_ext,
+            "files_rejected_status": self.files_rejected_status,
+            "files_rejected_size": self.files_rejected_size,
+            "samples_saved": self._samples_saved,
+            "samples_failed": self._samples_failed,
+            "pairs_saved": self.pairs_saved,
+            "label_distribution": dict(self.label_counts),
+            "cwe_distribution": dict(self.cwe_counts),
+            "repo_distribution": dict(self.repo_sample_counts),
+            "tokens_available": len(self.rotator.tokens),
+        }
+
+    def print_summary(self) -> None:
+        summary = self._build_summary()
+        print("\n" + "=" * 60)
+        print("REPO MINER SUMMARY")
+        print("=" * 60)
+        print(f"Repos completed:         {summary['repos_completed']}/{len(REPOS)}")
+        print(f"Commits scored:          {summary['commits_scored']}")
+        print(f"Commits fetched (diff):  {summary['commits_fetched']}")
+        print(f"Commits skipped (score): {summary['commits_skipped_score']}")
+        print(f"Commits skipped (excl):  {summary['commits_skipped_exclusion']}")
+        print(f"Commits skipped (dedup): {summary['commits_skipped_dedup']}")
+        print(f"Commits stale (404):     {summary['commits_stale_404']}")
+        print(f"Files qualifying:        {summary['files_qualifying']}")
+        print(f"Samples saved:           {summary['samples_saved']}")
+        print(f"Samples failed:          {summary['samples_failed']}")
+        print(f"Pairs saved:             {summary['pairs_saved']}")
+        print(f"GitHub tokens:           {summary['tokens_available']}")
+        if summary["label_distribution"]:
+            print("\nLabel Distribution:")
+            for label, count in sorted(summary["label_distribution"].items()):
+                label_str = "vulnerable" if label == 1 else "safe"
+                print(f"  {label_str} (label={label}): {count}")
+        if summary["cwe_distribution"]:
+            print("\nCWE Distribution:")
+            for cwe, count in sorted(
+                summary["cwe_distribution"].items(), key=lambda x: -x[1]
+            ):
+                print(f"  {cwe}: {count}")
+        if summary["repo_distribution"]:
+            print("\nPer-Repo Distribution:")
+            for repo_name, count in sorted(
+                summary["repo_distribution"].items(), key=lambda x: -x[1]
+            ):
+                print(f"  {repo_name}: {count}")
+        print("=" * 60)
 
 
-def main():
-    """Main entry point for repository mining."""
-    import argparse
+# ══════════════════════════════════════════════════════════════════════════
+# CLI
+# ══════════════════════════════════════════════════════════════════════════
 
-    parser = argparse.ArgumentParser(description="Enhanced Repository Miner")
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="data/raw/opensource",
-        help="Output directory for collected samples"
+def main() -> None:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
+    parser = argparse.ArgumentParser(
+        description="StreamGuard Repo Miner — API-only commit mining"
     )
     parser.add_argument(
-        "--no-cache",
+        "--output-dir",
+        default="training/scripts/collection/data/raw/repo",
+        help="Output directory for samples JSONL",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        default="training/scripts/collection/data/raw/checkpoints",
+        help="Checkpoint directory",
+    )
+    parser.add_argument(
+        "--github-token",
+        help="GitHub token(s), comma-separated for rotation",
+    )
+    parser.add_argument(
+        "--repo-filter",
+        help="Process only this repo (e.g., 'openssl/openssl')",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=0,
+        help="Stop after saving N samples (0 = unlimited)",
+    )
+    parser.add_argument(
+        "--dry-run",
         action="store_true",
-        help="Disable caching of cloned repositories"
+        help="Process but don't save samples",
+    )
+    parser.add_argument(
+        "--cve-samples-path",
+        help="Path to cve_samples.jsonl for cross-dedup",
+    )
+    parser.add_argument(
+        "--osv-samples-path",
+        help="Path to osv_samples.jsonl for cross-dedup",
+    )
+    parser.add_argument(
+        "--github-advisory-samples-path",
+        help="Path to github_advisory_samples.jsonl for cross-dedup",
     )
 
     args = parser.parse_args()
 
-    # Initialize miner
-    miner = EnhancedRepoMiner(
+    tokens = None
+    if args.github_token:
+        tokens = [t.strip() for t in args.github_token.split(",") if t.strip()]
+
+    miner = RepoMiner(
         output_dir=args.output_dir,
-        cache_enabled=not args.no_cache
+        checkpoint_dir=args.checkpoint_dir,
+        github_tokens=tokens,
+        dry_run=args.dry_run,
+        max_samples=args.max_samples,
+        repo_filter=args.repo_filter,
+        cve_samples_path=args.cve_samples_path,
+        osv_samples_path=args.osv_samples_path,
+        github_advisory_samples_path=args.github_advisory_samples_path,
     )
 
-    # Collect samples
-    logger.info("Starting enhanced repository mining...")
-    samples = miner.collect()
+    logger.info("Starting repo miner collection...")
+    summary = miner.collect()
+    miner.print_summary()
 
-    # Save samples
-    miner.save_samples_to_file(samples)
-
-    # Print statistics
-    stats = miner.get_stats()
-    logger.info("\n" + "="*50)
-    logger.info("Mining Complete!")
-    logger.info("="*50)
-    logger.info(f"Total samples collected: {stats['total_samples']}")
-    logger.info(f"Errors encountered: {stats['errors_count']}")
-    logger.info("\nSamples per repository:")
-    for repo, count in stats['samples_per_repo'].items():
-        logger.info(f"  {repo}: {count}")
-    logger.info("\nSamples per vulnerability type:")
-    for vuln, count in stats['samples_per_vulnerability'].items():
-        logger.info(f"  {vuln}: {count}")
+    # Save summary
+    summary_path = Path(args.output_dir) / "repo_summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    logger.info(f"Summary saved to {summary_path}")
 
 
 if __name__ == "__main__":

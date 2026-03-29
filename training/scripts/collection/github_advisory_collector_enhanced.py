@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 
 import requests
+from dotenv import load_dotenv
 from base_collector import BaseCollector
 
 
@@ -27,8 +28,8 @@ class GitHubAdvisoryCollectorEnhanced(BaseCollector):
     # REST API for repository and diff operations
     REST_API = "https://api.github.com"
 
-    # Supported ecosystems
-    ECOSYSTEMS = ["PIP", "NPM", "MAVEN", "RUBYGEMS", "GO", "COMPOSER", "NUGET", "CARGO"]
+    # Supported ecosystems - Filter for Python and JavaScript only (as per collection plan)
+    ECOSYSTEMS = ["PIP", "NPM"]  # PIP = Python, NPM = JavaScript/Node.js
 
     # Severity levels
     SEVERITIES = ["LOW", "MODERATE", "HIGH", "CRITICAL"]
@@ -36,6 +37,9 @@ class GitHubAdvisoryCollectorEnhanced(BaseCollector):
     # Rate limit configuration
     RATE_LIMIT_POINTS_PER_HOUR = 5000
     RATE_LIMIT_BUFFER = 100  # Keep buffer for safety
+
+    # Console progress (helps during smoke tests)
+    DEFAULT_LOG_EVERY = 25  # print every N processed nodes per combo
 
     # Package manager registry URLs
     PACKAGE_REGISTRIES = {
@@ -60,10 +64,46 @@ class GitHubAdvisoryCollectorEnhanced(BaseCollector):
         """
         super().__init__(output_dir, cache_enabled)
 
+        # Console verbosity controls (can be overridden by CLI)
+        self.verbose = False
+        self.log_every = self.DEFAULT_LOG_EVERY
+
+        # Load `.env` reliably (user may run from `training/scripts/collection`)
+        try:
+            here = Path(__file__).resolve()
+            candidates = [
+                Path.cwd() / ".env",
+                here.parents[3] / ".env",  # repo root
+            ]
+            for p in candidates:
+                if p.exists():
+                    load_dotenv(dotenv_path=p, override=False)
+                    break
+            else:
+                load_dotenv(override=False)
+        except Exception:
+            load_dotenv(override=False)
+
         # Get GitHub token from parameter first, then environment
-        self.github_token = github_token or os.getenv("GITHUB_TOKEN")
+        # Try both GITHUB_TOKEN and GITHUB_TOKENS (comma-separated)
+        raw_token = github_token or os.getenv("GITHUB_TOKEN") or os.getenv("GITHUB_TOKENS")
+        if raw_token and ',' in raw_token:
+            # Take the first token from comma-separated list
+            self.github_token = raw_token.split(',')[0].strip()
+        else:
+            self.github_token = raw_token.strip() if raw_token else None
+            
+        # #region agent log - Hypothesis A: Check token loading in GitHub collector
+        _log_path = r"c:\Users\Vimal Sajan\streamguard\.cursor\debug.log"
+        from datetime import datetime as _dt
+        with open(_log_path, "a") as _f: _f.write('{"hypothesisId":"A","location":"github_collector:66","message":"token_loaded","data":{"raw_token_len":'+str(len(raw_token) if raw_token else 0)+',"final_token_len":'+str(len(self.github_token) if self.github_token else 0)+',"token_first20":"'+(self.github_token[:20] if self.github_token else "NONE")+'"},"timestamp":'+str(int(_dt.now().timestamp()*1000))+'}\n')
+        # #endregion
+            
         if not self.github_token:
-            raise ValueError("GITHUB_TOKEN is required. Pass as parameter or set GITHUB_TOKEN environment variable")
+            raise ValueError(
+                "GitHub token is required. Pass `github_token=...` or set "
+                "GITHUB_TOKEN or GITHUB_TOKENS in environment/.env."
+            )
 
         # Setup headers
         self.headers = {
@@ -99,53 +139,102 @@ class GitHubAdvisoryCollectorEnhanced(BaseCollector):
 
         return self.collect_all_advisories(target_samples=10000)
 
-    def collect_all_advisories(self, target_samples: int = 10000) -> List[Dict]:
+    def collect_all_advisories(self, target_samples: int = 10000, queue=None) -> List[Dict]:
         """
         Collect advisories across all ecosystems and severities.
 
         Args:
             target_samples: Target number of samples to collect
+            queue: Optional queue for progress updates
 
         Returns:
             List of collected vulnerability samples
         """
         all_samples = []
-        samples_per_combination = target_samples // (len(self.ECOSYSTEMS) * len(self.SEVERITIES))
+        # Calculate samples per combination for maximum collection
+        # With 2 ecosystems x 4 severities = 8 combos, distribute target_samples evenly
+        # Use a reasonable cap (5000) to prevent excessive memory usage per combo
+        samples_per_combination = min(5000, target_samples // (len(self.ECOSYSTEMS) * len(self.SEVERITIES)))
 
         print(f"\nTarget per ecosystem/severity combination: {samples_per_combination}")
         print(f"DEBUG: Starting collection with {len(self.ECOSYSTEMS)} ecosystems x {len(self.SEVERITIES)} severities")
+        print(f"DEBUG: Total target: {target_samples}, realistic target: {samples_per_combination * len(self.ECOSYSTEMS) * len(self.SEVERITIES)}")
 
-        for ecosystem in self.ECOSYSTEMS:
-            for severity in self.SEVERITIES:
-                print(f"\n{'='*60}")
-                print(f"Collecting: {ecosystem} / {severity}")
-                print(f"{'='*60}")
+        try:
+            for ecosystem in self.ECOSYSTEMS:
+                for severity in self.SEVERITIES:
+                    print(f"\n{'='*60}")
+                    print(f"Collecting: {ecosystem} / {severity}")
+                    print(f"{'='*60}")
 
-                try:
-                    samples = self.collect_by_ecosystem_severity(
-                        ecosystem=ecosystem,
-                        severity=severity,
-                        max_samples=samples_per_combination
-                    )
+                    try:
+                        samples = self.collect_by_ecosystem_severity(
+                            ecosystem=ecosystem,
+                            severity=severity,
+                            max_samples=samples_per_combination
+                        )
 
-                    print(f"DEBUG: collect_by_ecosystem_severity returned {len(samples)} samples")
-                    all_samples.extend(samples)
+                        print(f"DEBUG: collect_by_ecosystem_severity returned {len(samples)} samples")
+                        all_samples.extend(samples)
 
-                    print(f"Collected {len(samples)} samples for {ecosystem}/{severity}")
-                    print(f"Total samples so far: {len(all_samples)}")
-                    print(f"DEBUG: all_samples list now has {len(all_samples)} items")
+                        print(f"Collected {len(samples)} samples for {ecosystem}/{severity}")
+                        print(f"Total samples so far: {len(all_samples)}")
+                        print(f"DEBUG: all_samples list now has {len(all_samples)} items")
 
-                    # Save intermediate results
-                    if len(all_samples) % 1000 == 0:
-                        self._save_intermediate_results(all_samples)
+                        # Send progress update to orchestrator
+                        if queue:
+                            try:
+                                # #region agent log - Hypothesis C: Progress updates
+                                _log_path = r"c:\Users\Vimal Sajan\streamguard\.cursor\debug.log"
+                                from datetime import datetime as _dt
+                                with open(_log_path, "a") as _f: _f.write('{"hypothesisId":"C","location":"github_collector:155","message":"progress_update","data":{"samples":'+str(len(all_samples))+',"target":'+str(target_samples)+',"ecosystem":"'+ecosystem+'","severity":"'+severity+'"},"timestamp":'+str(int(_dt.now().timestamp()*1000))+'}\n')
+                                # #endregion
+                                queue.put({
+                                    'collector': 'github',
+                                    'status': 'running',
+                                    'message': f'github progress: {len(all_samples)}/{target_samples}',
+                                    'samples_collected': len(all_samples),
+                                    'target_samples': target_samples,
+                                    'timestamp': datetime.now().isoformat()
+                                })
+                                # #region agent log - Hypothesis C: queue.put succeeded
+                                with open(_log_path, "a") as _f: _f.write('{"hypothesisId":"C","location":"github_collector:170","message":"queue_put_ok","data":{"samples":'+str(len(all_samples))+',"ecosystem":"'+ecosystem+'","severity":"'+severity+'"},"timestamp":'+str(int(_dt.now().timestamp()*1000))+'}\n')
+                                # #endregion
+                            except Exception as e:
+                                # #region agent log - Hypothesis C: queue.put failed
+                                _log_path = r"c:\Users\Vimal Sajan\streamguard\.cursor\debug.log"
+                                from datetime import datetime as _dt
+                                with open(_log_path, "a") as _f: _f.write('{"hypothesisId":"C","location":"github_collector:178","message":"queue_put_fail","data":{"error":"'+str(e).replace('"','\\"')[:200]+'"},"timestamp":'+str(int(_dt.now().timestamp()*1000))+'}\n')
+                                # #endregion
+                                print(f"WARNING: Failed to send progress update: {e}")
 
-                except Exception as e:
-                    error_msg = f"Error collecting {ecosystem}/{severity}: {str(e)}"
-                    print(f"ERROR: {error_msg}")
-                    self.log_error(error_msg, {"ecosystem": ecosystem, "severity": severity})
+                        # Save after EVERY ecosystem/severity combo
+                        if len(all_samples) > 0:
+                            self._save_intermediate_results(all_samples)
+                            print(f"DEBUG: Saved intermediate results ({len(all_samples)} samples)")
 
-                # Check rate limits
-                self._check_rate_limits()
+                    except Exception as e:
+                        error_msg = f"Error collecting {ecosystem}/{severity}: {str(e)}"
+                        print(f"ERROR: {error_msg}")
+                        self.log_error(error_msg, {"ecosystem": ecosystem, "severity": severity})
+
+                    # Check rate limits
+                    self._check_rate_limits()
+                    
+                    # Early exit if we've collected enough overall
+                    if len(all_samples) >= target_samples:
+                        print(f"DEBUG: Reached overall target ({target_samples}), stopping collection")
+                        break
+                
+                # Also break outer loop if target reached
+                if len(all_samples) >= target_samples:
+                    break
+        except KeyboardInterrupt:
+            print(f"\n! Collection interrupted. Saving {len(all_samples)} samples collected so far...")
+            if len(all_samples) > 0:
+                self._save_intermediate_results(all_samples)
+            # Re-raise to let the orchestrator know
+            raise
 
         # Deduplicate samples
         print(f"\nDEBUG: Before deduplication: {len(all_samples)} samples")
@@ -190,7 +279,10 @@ class GitHubAdvisoryCollectorEnhanced(BaseCollector):
         from datetime import timezone
         start_date = datetime.now(timezone.utc) - timedelta(days=3*365)
 
-        while has_next_page and len(samples) < max_samples:
+        pages_fetched = 0
+        max_pages = 1000  # High limit for maximum collection (pagination stops when max_samples reached or no more pages)
+        while has_next_page and len(samples) < max_samples and pages_fetched < max_pages:
+            page_start_ts = time.time()
             # Build and execute GraphQL query
             query_result = self._query_advisories(
                 ecosystem=ecosystem,
@@ -209,14 +301,28 @@ class GitHubAdvisoryCollectorEnhanced(BaseCollector):
             nodes = vulnerabilities.get("nodes", [])
             page_info = vulnerabilities.get("pageInfo", {})
 
-            print(f"DEBUG: Found {len(nodes)} vulnerability nodes in this page")
+            if self.verbose:
+                print(
+                    f"[github] {ecosystem}/{severity}: page {pages_fetched + 1} "
+                    f"received {len(nodes)} nodes (samples={len(samples)}/{max_samples})",
+                    flush=True,
+                )
 
             # Check for errors in response
             if "errors" in query_result:
                 print(f"WARNING: GraphQL errors: {query_result['errors']}")
 
             # Process each vulnerability
-            for vuln_node in nodes:
+            # #region agent log - Hypothesis B2: Check processing loop
+            _log_path = r"c:\Users\Vimal Sajan\streamguard\.cursor\debug.log"
+            from datetime import datetime as _dt
+            with open(_log_path, "a") as _f: _f.write('{"hypothesisId":"B2","location":"github_collector:222","message":"process_loop_start","data":{"nodes_count":'+str(len(nodes))+',"ecosystem":"'+ecosystem+'","severity":"'+severity+'"},"timestamp":'+str(int(_dt.now().timestamp()*1000))+'}\n')
+            _skipped_date = 0
+            _processed = 0
+            _no_sample = 0
+            # #endregion
+            
+            for idx_in_page, vuln_node in enumerate(nodes, start=1):
                 advisory = vuln_node.get("advisory", {})
 
                 # Check date range
@@ -224,25 +330,53 @@ class GitHubAdvisoryCollectorEnhanced(BaseCollector):
                 if published_at:
                     pub_date = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
                     if pub_date < start_date:
+                        _skipped_date += 1
                         continue
+
+                if self.verbose:
+                    pkg = (vuln_node.get("package", {}) or {}).get("name") or "unknown"
+                    ghsa = advisory.get("ghsaId") or "unknown"
+                    print(f"[github] processing {ecosystem}/{severity}: {ghsa} pkg={pkg}", flush=True)
 
                 # Extract sample from vulnerability node
                 sample = self._process_vulnerability_node(vuln_node, ecosystem, severity)
                 if sample:
                     samples.append(sample)
                     self.samples_collected += 1
+                    _processed += 1
                 else:
-                    print(f"DEBUG: Failed to process vulnerability node (advisory_id: {advisory.get('ghsaId', 'unknown')})")
+                    _no_sample += 1
 
-                if len(samples) >= max_samples:
-                    print(f"DEBUG: Reached max_samples ({max_samples}), breaking")
-                    break
+                # Lightweight progress ticker (helps when not running dashboard)
+                if (idx_in_page % max(1, int(self.log_every))) == 0:
+                    elapsed = time.time() - page_start_ts
+                    print(
+                        f"[github] {ecosystem}/{severity}: processed {idx_in_page}/{len(nodes)} nodes "
+                        f"(+{_processed} samples, {_no_sample} no-sample, {_skipped_date} skipped-date) "
+                        f"in {elapsed:.1f}s | total samples={len(samples)}/{max_samples}",
+                        flush=True,
+                    )
+            
+            # #region agent log - Hypothesis B2: Check processing results
+            with open(_log_path, "a") as _f: _f.write('{"hypothesisId":"B2","location":"github_collector:252","message":"process_loop_end","data":{"skipped_date":'+str(_skipped_date)+',"processed":'+str(_processed)+',"no_sample":'+str(_no_sample)+',"samples_so_far":'+str(len(samples))+'},"timestamp":'+str(int(_dt.now().timestamp()*1000))+'}\n')
+            # #endregion
+
+            if len(samples) >= max_samples:
+                print(f"DEBUG: Reached max_samples ({max_samples}), breaking")
+                break
 
             # Update pagination
             has_next_page = page_info.get("hasNextPage", False)
             cursor = page_info.get("endCursor")
+            pages_fetched += 1
 
-            print(f"DEBUG: Pagination - hasNextPage: {has_next_page}, cursor: {cursor is not None}")
+            if self.verbose:
+                print(
+                    f"[github] {ecosystem}/{severity}: page done -> hasNextPage={has_next_page}, "
+                    f"cursor={'yes' if cursor else 'no'}, page={pages_fetched}/{max_pages}, "
+                    f"samples={len(samples)}/{max_samples}",
+                    flush=True,
+                )
 
             # Rate limiting
             self.rate_limit(requests_per_second=0.5)  # 2 seconds per request
@@ -341,6 +475,14 @@ class GitHubAdvisoryCollectorEnhanced(BaseCollector):
             )
 
             print(f"DEBUG: Response status code: {response.status_code}")
+            
+            # #region agent log - Hypothesis D: Check API response
+            _log_path = r"c:\Users\Vimal Sajan\streamguard\.cursor\debug.log"
+            from datetime import datetime as _dt
+            _resp_text = response.text[:500] if response.text else "EMPTY"
+            with open(_log_path, "a") as _f: _f.write('{"hypothesisId":"D","location":"github_collector:352","message":"graphql_response","data":{"status_code":'+str(response.status_code)+',"ecosystem":"'+ecosystem+'","severity":"'+severity+'","response_preview":"'+_resp_text.replace('"','\\"').replace('\n',' ')[:200]+'"},"timestamp":'+str(int(_dt.now().timestamp()*1000))+'}\n')
+            # #endregion
+            
             response.raise_for_status()
 
             result = response.json()
@@ -386,6 +528,12 @@ class GitHubAdvisoryCollectorEnhanced(BaseCollector):
         # Get package information directly from vulnerability node
         package_info = vuln_node.get("package", {})
         package_name = package_info.get("name")
+
+        # #region agent log - Hypothesis B3: Check package extraction
+        _log_path = r"c:\Users\Vimal Sajan\streamguard\.cursor\debug.log"
+        from datetime import datetime as _dt
+        with open(_log_path, "a") as _f: _f.write('{"hypothesisId":"B3","location":"github_collector:420","message":"process_node","data":{"ghsa_id":"'+(ghsa_id or "NONE")+'","package_name":"'+(package_name or "NONE")+'","has_package_info":'+str(bool(package_info))+'},"timestamp":'+str(int(_dt.now().timestamp()*1000))+'}\n')
+        # #endregion
 
         if not package_name:
             return None
@@ -990,6 +1138,17 @@ def main():
         action="store_true",
         help="Disable caching"
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print what is being processed while collecting"
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=GitHubAdvisoryCollectorEnhanced.DEFAULT_LOG_EVERY,
+        help="Print progress every N processed nodes (default: 25)"
+    )
 
     args = parser.parse_args()
 
@@ -998,6 +1157,8 @@ def main():
         output_dir=args.output_dir,
         cache_enabled=not args.no_cache
     )
+    collector.verbose = bool(args.verbose)
+    collector.log_every = max(1, int(args.log_every))
 
     # Collect data
     try:

@@ -1,0 +1,561 @@
+StreamGuard
+CFA Pair Generation
+Risk Analysis Document
+When to Run Production  ?  26 Risks Catalogued  ?  Execution Order Guide
+7 Critical  ?  9 High  ?  7 Medium  ?  3 Low
+CRITICAL
+7
+Project-ending
+HIGH
+9
+Week of rework
+MEDIUM
+7
+Degraded quality
+LOW
+3
+Operational friction
+March 2026  |  StreamGuard v1.0  |  Stage 3 CFA Generation
+1. When to Run Production ? The Definitive Answer
+? ANSWER: Build ALL 5 tiers and complete CFA-INT integration FIRST. Then run ONE single production Stage 3.
+Never run Stage 3 production after each tier. This wastes API budget, time, and creates re-processing cascades.
+Use --dry-run --max-samples 20 --cwe-filter CWE-X after each tier story to verify correctness.
+1.1  Why You Cannot Run Stage 3 Incrementally
+Stage 3 is not like other stages. It is expensive in three ways simultaneously: API calls to Claude, wall-clock time (22+ hours), and downstream cascade. Running it before all tiers are complete wastes all three.
+Cost if you run Stage 3 three times (once per tier group):
+Scenario
+API Cost
+Wall-Clock Time
+Cascade Re-runs
+Run after each tier (?3 runs)
+~$250?380
+66?90 hours
+Stage 4+5+6+7 each time
+Build all tiers first, ONE run
+~$85?120
+22?28 hours
+None ? one clean run
+1.2  The Correct Step-by-Step Order
+Follow this sequence exactly. Do not deviate.
+1. Build CFA-F1 (Foundation: CWE_TIER_MAP, 7-gate validator, orchestrator stubs)
+2. Build CFA-T1 (Tier 1 AST rules: CWE-134, CWE-120, CWE-476)
+3. Build CFA-T2 (Tier 2 zero-shot: CWE-121, CWE-122, CWE-125)
+4. Build CFA-T3 (Tier 3 CoT: CWE-89, CWE-78, CWE-190, CWE-79)
+5. Build cfa_exemplar_db.py ? run OFFLINE to build exemplar DB from real CVE pairs
+6. Build CFA-T4 (Tier 4 few-shot: CWE-416, CWE-119) ? requires exemplar DB to exist
+7. Build CFA-T5 (Tier 5 critique-refine fallback)
+8. Build CFA-INT (wire all tiers into run_stage3_tiered, quality report, escalation logic)
+9. Run: python -m pytest tests/test_cfa_*.py ? ALL 70 tests must PASS
+10. Run dry-run verification on 20 samples per CWE (12 CWEs ? 20 = 240 total)
+11. ? Run ONE production Stage 3 ? with checkpoint enabled, background process
+12. Verify cfa_quality_report.json ? all per-CWE thresholds must meet minimums
+13. Continue to Stage 4 (Joern CPG), Stage 5 (Colab GPU), Stage 6, Stage 7
+1.3  Smoke Test Protocol Between Tiers
+After completing each tier story, run this before moving to the next tier. These use --dry-run so zero API cost.
+After
+Smoke Test Command
+What to Check
+Gate to Next Tier
+CFA-F1
+python -m pytest tests/test_cfa_foundation.py
+8/8 pass; Gate 5 is SOFT (score=0.6 not reject); SARD skip works
+All 8 tests pass
+CFA-T1
+stage3_cfa.py --dry-run --max-samples 20 --cwe-filter CWE-134
+100% compile rate; CFA differs from original; fix signature present
+tier=1; compile_rate=1.0
+CFA-T1
+stage3_cfa.py --dry-run --max-samples 20 --cwe-filter CWE-120
+95%+ compile; pointer param case returns [] and escalates
+Pointer param detected
+CFA-T2
+stage3_cfa.py --dry-run --max-samples 20 --cwe-filter CWE-121
+?83% compile; Option A/B/C structure visible; [FIXED_CODE_START] parsed
+compile_rate ? 0.80
+CFA-T3
+stage3_cfa.py --dry-run --max-samples 20 --cwe-filter CWE-89
+CoT text stripped from output; Gate 6 taint check fires
+taint_break_rate > 0
+CFA-T4
+python cfa_exemplar_db.py --verify
+?20 CWE-416 real pairs in DB; exemplar_db.json exists
+DB has ?20 CWE-416
+CFA-T4
+stage3_cfa.py --dry-run --max-samples 10 --cwe-filter CWE-416
+?65% compile; CWE-416 structural check fires
+tier=4 in output
+CFA-T5
+python -m pytest tests/test_cfa_tier5.py
+8/8 pass; no infinite loop; score multiplier 0.85 applied
+All 8 tests pass
+CFA-INT
+python -m pytest tests/test_cfa_integration.py
+8/8 pass; SARD skip confirmed; escalation fires; quality report written
+All 70 total tests pass
+2. Risk Register ? All 26 Risks
+Probability: CERTAIN=90%+, HIGH=60-90%, MEDIUM=30-60%, LOW=<30%. Impact: CRITICAL=re-run Stage 3+4+5+6, HIGH=days of rework, MEDIUM=degraded quality, LOW=hours of cleanup.
+ID
+Risk Title
+SEV
+PROB
+Tiers Affected
+Mitigation Status
+R-01
+Tier 1 AST fix applied to pointer param (sizeof wrong)
+CRITICAL
+HIGH
+Tier 1
+Requires PR-01 pointer param AST check
+R-02
+SARD samples processed by LLM ? native pairs destroyed
+CRITICAL
+HIGH
+All
+source.startswith('sard') check in orchestrator
+R-03
+pair_id not saved to HDF5 ? L_CFA trains on random pairs
+CRITICAL
+HIGH
+All
+Stage 6 must write pair_id to HDF5 attrs
+R-04
+Stage 3 run before exemplar DB built ? Tier 4 is zero-shot
+CRITICAL
+HIGH
+Tier 4
+cfa_exemplar_db.py must run first
+R-05
+LLM introduces new vulnerability while fixing original
+CRITICAL
+MEDIUM
+Tier 2-5
+Secondary scan on accepted CFAs (Gate 7b)
+R-06
+API cost explosion from max_attempts=10 on CWE-416
+CRITICAL
+HIGH
+Tier 4
+Hard cost cap per CWE; fallback to Tier 5
+R-07
+Stage 3 run incrementally ? 3? API cost and cascade re-runs
+CRITICAL
+HIGH
+All
+Build all tiers FIRST ? one production run only
+R-08
+CoT output text pollutes extract_c_code ? code contains reasoning
+HIGH
+HIGH
+Tier 3-5
+[FIXED_CODE_START]...[FIXED_CODE_END] markers mandatory
+R-09
+Gate 5 too restrictive ? valid custom fix signatures rejected
+HIGH
+HIGH
+All
+Gate 5 must be SOFT (quality_score=0.6, not reject)
+R-10
+Tier 1 multi-dimensional array ? sizeof wrong for 2D arrays
+HIGH
+MEDIUM
+Tier 1
+Detect 2D array access; escalate to Tier 2
+R-11
+Gate 6 false negatives ? indirect taint path not caught by regex
+HIGH
+MEDIUM
+Tier 3 injection
+Optional Joern taint on accepted injection CFAs
+R-12
+Exemplar DB built from SARD synthetic pairs only (no real CVEs)
+HIGH
+MEDIUM
+Tier 4
+Assert ?20 real CVE/repo pairs per CWE before DB build
+R-13
+Tier 4 exemplar selects wrong CWE-416 subtype examples
+HIGH
+MEDIUM
+Tier 4
+Tag exemplars by subtype; match-on-subtype selection
+R-14
+Duplicate CFAs from Tier 1 ? identical fixes across SARD variants
+HIGH
+HIGH
+Tier 1
+Re-run Stage 2 MinHash dedup AFTER Stage 3 on CFA samples
+R-15
+Anthropic API 529 / rate limit mid-run ? no resume
+HIGH
+HIGH
+Tier 2-5
+tenacity retry + checkpoint every 200 samples
+R-16
+CWE-416 CPG diff count > 10 ? Gate 7 rejects valid CFAs
+MEDIUM
+HIGH
+Tier 4
+CWE-416 Gate 7 limit = 20 nodes, not 10
+R-17
+Long functions >100 lines exceed effective LLM focus
+MEDIUM
+MEDIUM
+Tier 2-5
+APPATCH-style slice: send only vulnerability context (20-50 lines)
+R-18
+Burst API retries trigger Anthropic secondary rate limit
+MEDIUM
+HIGH
+Tier 2-5
+Add jitter: time.sleep(random.uniform(0.5, 2.0)) between samples
+R-19
+Wrong tier assigned to CWE ? silent quality degradation
+MEDIUM
+LOW
+All
+CWE_TIER_MAP is frozen; never change without re-verifying thresholds
+R-20
+CFA output writes pair_id incorrectly ? both sides same label
+MEDIUM
+MEDIUM
+All
+Inline pair validation: finalize_pairs() after Stage 3 completes
+R-21
+cfa_quality_report.json not written ? audit silently skips CFA checks
+MEDIUM
+MEDIUM
+All
+Assert report exists in pre_training_audit.py before training
+R-22
+Stage 3 checkpoint corrupted on kill -9 mid-write
+MEDIUM
+MEDIUM
+All
+Atomic write: .tmp ? os.replace(); cleanup .tmp on startup
+R-23
+CWE-79 exemplar DB too small (<10 pairs) ? Tier 4 degrades
+LOW
+HIGH
+Tier 3/4 CWE-79
+Accept Tier 3 only for CWE-79 if <20 real pairs available
+R-24
+Tier 1 fix changes function semantics on multi-call functions
+LOW
+MEDIUM
+Tier 1
+Semantic equivalence test on 5 sample inputs after Tier 1 fix
+R-25
+API key expires mid-run (Anthropic key rotation)
+LOW
+LOW
+Tier 2-5
+Check key validity before starting; add 401 handler in LLM client
+R-26
+CFA samples not re-deduped ? near-identical Tier 1 CFAs in HDF5
+LOW
+HIGH
+Tier 1
+Run Stage 2 L4 MinHash on with_cfa/ output before Stage 4
+3. Critical Risks ? Full Detail
+The following 7 risks will either invalidate the research, require a full Stage 3 re-run, or corrupt the training objective. All mitigations must be implemented before the production run.
+R-01  [CRITICAL]  Tier 1 AST Fix Applied to Pointer Parameter ? sizeof Returns Wrong Value
+? PROBLEM
+Tier 1 applies: strncpy(dst, src, sizeof(dst)-1) for CWE-120 buffer copy fixes.
+If dst is char dst[100] (array): sizeof(dst) = 100 ? correct.
+If dst is char *dst (pointer parameter): sizeof(dst) = 4 or 8 bytes ? WRONG.
+The 'fixed' CFA copies only 3 or 7 bytes. Gates 3, 4, 5 all pass silently.
+? IMPACT
+The model sees this CFA as label=0 (safe). It trains to associate '3-byte copy limit' with safety.
+This is a spurious correlation INTRODUCED by the fix, not eliminated by it.
+CWE-120 is the largest CWE in the dataset (9,000 target pairs). Even 20% pointer-param error rate = 1,800 corrupt CFAs entering training.
+? MITIGATION
+In fix_cwe120_ast(): before applying any fix, check the AST declaration of the destination variable.
+Use tree-sitter: search enclosing function's parameter list for pointer_declarator with matching name.
+If dst is a pointer parameter: return [] from tier1_generate() ? do NOT apply the fix.
+The orchestrator then escalates to Tier 2 with an explicit instruction to use caller-provided size.
+Add a smoke test: find a SARD CWE-120 sample with char *dst parameter. Verify tier1_generate returns [].
+? VERIFICATION
+After building CFA-T1: python stage3_cfa.py --dry-run --max-samples 5 --cwe-filter CWE-120
+Print the first 5 CFAs. If any contains sizeof(ptr_param)-1 where ptr_param is a function parameter: STOP.
+The pointer detection is broken. Fix before proceeding.
+R-02  [CRITICAL]  SARD Samples Processed by LLM ? Native Pairs Destroyed
+? PROBLEM
+SARD samples (source='sard') already have CFA pairs from process_sard.py ? the _bad() and _good() functions.
+These are NIST-validated pairs. The pair_id was set correctly. The labels are correct.
+If Stage 3 processes SARD samples, it generates NEW LLM CFAs and assigns a NEW pair_id.
+The original good() function becomes orphaned (pair_id no longer matches).
+? IMPACT
+L_CFA trains on LLM-generated quality pairs instead of NIST ground-truth pairs for the 41K SARD samples.
+18,687 valid SARD CFA pairs are replaced with LLM pairs of lower or unpredictable quality.
+The contrastive loss signal is degraded for ~60% of the training data.
+? MITIGATION
+At the very top of run_stage3_tiered(), before ANY processing: check if source.startswith('sard') OR cfa_type == 'native'.
+If true: write the original sample to output and continue to next sample. Zero LLM calls.
+Add a count: sard_skipped. Log it at completion. Expected: ~41K skips on the full dataset.
+Integration test INT-04: grep output for sard source. Zero sard_cfa entries should exist.
+? VERIFICATION
+After building CFA-INT: python stage3_cfa.py --dry-run --max-samples 50
+Check output: grep '"source": "sard_cfa"' output.jsonl ? must return zero results.
+If any sard_cfa entries found: the SARD skip is broken. Do not run production.
+R-03  [CRITICAL]  pair_id Not Saved to HDF5 ? CFAAwareBatchSampler Treats All as Singletons
+? PROBLEM
+Stage 6 (stage6_graphs.py) builds the HDF5 file. It saves x, edge_index, edge_attr, y.
+If it does NOT save pair_id as an HDF5 group attribute (grp.attrs['pair_id'] = ...), the sampler has no pairing info.
+CFAAwareBatchSampler reads pair_id from HDF5 attrs. Missing attr ? reads empty string ? treats as singleton.
+All CFA pairs are split across batches as if they were independent samples.
+? IMPACT
+L_CFA receives emb_v and emb_vp from different (unrelated) pairs in the same batch.
+The contrastive loss pushes random embeddings apart ? no better than random initialization.
+F1 may actually drop below Config B (no-CFA baseline) because the loss adds noise.
+This is silent ? no error is thrown, training converges, but pairwise_accuracy is near 0%.
+? MITIGATION
+In stage6_graphs.py, when writing each graph group: grp.attrs['pair_id'] = sample.get('pair_id', '')
+Also save: grp.attrs['cfa_tier'] = sample.get('cfa_tier', 0) for diagnostics.
+In CFADataset._build_index(): str(grp.attrs.get('pair_id', '')) ? never KeyError.
+Verification: open HDF5, check 10 random samples have pair_id attr. For CFA samples: attr must be non-empty UUID.
+? VERIFICATION
+python -c "import h5py; f=h5py.File('all_graphs.h5','r'); s=list(f.keys())[100]; print(dict(f[s].attrs))"
+Output must contain 'pair_id' key. For a CFA sample: value must be a valid UUID string, not empty.
+If empty for all samples: Stage 6 is missing the attr write. Fix before running Stage 7.
+R-04  [CRITICAL]  Stage 3 Production Run Before Exemplar DB Built ? Tier 4 Degrades to Near Zero-Shot
+? PROBLEM
+Tier 4 (CWE-416, CWE-119) requires cfa_exemplar_db.py to have been run first.
+If exemplar_db.json does not exist OR has <10 pairs per CWE when Stage 3 starts:
+tier4_generate() calls exemplar_db.select_exemplars() and gets [] ? no examples.
+The few-shot prompt becomes a zero-shot prompt. CWE-416 performance drops to ~35% compile rate.
+? IMPACT
+CWE-416 generates ~1,000 pairs at 65% compile rate with exemplars. At 35%: only ~540 pairs.
+460 fewer CWE-416 CFA pairs entering training. Worst-group accuracy on CWE-416 is already the hardest.
+This can be fixed by re-running Stage 3 for CWE-416 only (--cwe-filter CWE-416) after building DB.
+But this wastes the Tier 4 API budget that was already spent on zero-shot attempts.
+? MITIGATION
+cfa_exemplar_db.py must be run AS PART OF the CFA-INT story, before Stage 3 production.
+Add a startup assertion in stage3_cfa.py: if any CWE in [CWE-416, CWE-119] is being processed AND exemplar_db is not provided: raise ValueError with message explaining the issue.
+The CLI should require --exemplar-db when processing Tier 4 CWEs.
+Run: python cfa_exemplar_db.py --target-cwes CWE-416 CWE-119 --verify ? confirm ?20 pairs each.
+? VERIFICATION
+python cfa_exemplar_db.py --verify ? output must show CWE-416: N pairs (N ? 20), CWE-119: N pairs (N ? 20).
+python stage3_cfa.py --dry-run --max-samples 5 --cwe-filter CWE-416 ? confirm exemplar code appears in prompt (add debug print).
+R-06  [CRITICAL]  API Cost Explosion ? Tier 4 CWE-416 with max_attempts=10
+? PROBLEM
+CWE-416 is Tier 4 with max_attempts=10. Expected ~1,500 vulnerable CWE-416 samples.
+1,500 samples ? 10 attempts = 15,000 API calls to Claude Haiku for CWE-416 alone.
+CWE-416 has ~35% success rate per attempt. Most samples need 5-8 attempts before success.
+At $0.0008/1K tokens (Haiku input), 15K calls ? ~800 tokens avg = ~$9.60 for CWE-416 alone.
+TOTAL across all CWEs with 22K vulnerable samples ? avg 7 attempts = ~$123 (within $120-150 budget).
+BUT: if compile_rate is lower than expected (Tier 4 exemplar DB is bad), attempts exhaust before success.
+10 failed attempts ? 22K samples ? $0.0008 = $176 in failed calls with zero output.
+? IMPACT
+Budget overrun of 40-80% if compile rate is lower than estimated.
+API key may have usage limits. Exceeding them mid-run stops collection with partial output.
+Partial Stage 3 output still needs Stage 4+5+6+7 to process, but with incomplete CFA pairs.
+? MITIGATION
+Set a hard per-CWE cost cap: COST_CAP_PER_CWE_USD = 15.0 (for CWE-416, CWE-119).
+Track tokens used per CWE using the API usage field in the response (input_tokens + output_tokens).
+If cost exceeds cap: log WARNING, switch remaining samples in that CWE to Tier 5 (simpler refine prompt).
+Use claude-haiku-4-5 for ALL CFA generation. Never use Sonnet in stage3_cfa.py.
+Set max_tokens=1024 for Tier 2/3, max_tokens=1500 for Tier 4. Do not exceed these.
+Add total_api_spend to cfa_quality_report.json for post-hoc analysis.
+? VERIFICATION
+After 100 CWE-416 samples: print running cost estimate. If >$1.50 for 100 samples: projected overrun.
+Expected: ~$0.60-0.90 per 100 CWE-416 samples. Above $1.50: exemplar DB not helping, switch strategy.
+R-07  [CRITICAL]  Running Stage 3 Production Incrementally After Each Tier ? 3? Cost and Cascade Re-Runs
+? PROBLEM
+Each Stage 3 production run takes 22-28 hours and costs $85-120 in API calls.
+Running after Tier 1 complete, then again after Tier 2, then again after all tiers = 3 runs.
+The output from Run 1 (Tier 1 CWEs only) and Run 2 (Tier 1+2 CWEs) are DIFFERENT files.
+Stage 4 (Joern CPG) must re-process ALL samples for each Stage 3 output change.
+Stage 4 at 0.08 samples/s ? 60K samples = ~208 hours per run. 3 Stage 4 runs = 624 hours (26 days).
+? IMPACT
+Total time if run incrementally: ~90 hours (Stage 3) + ~624 hours (Stage 4 re-runs) + 54 hours (Colab Stage 5 re-runs) = 768 hours.
+Total time if run once after all tiers: 25 hours (Stage 3) + 208 hours (Stage 4 once) + 27 min (Stage 5 once) = ~234 hours.
+Incremental approach is 3.3? slower and 3? more expensive.
+? MITIGATION
+Build all 7 tier stories (CFA-F1, T1, T2, T3, T4, T5, INT) before running ANY production Stage 3.
+Use --dry-run --max-samples 20 for all per-tier smoke tests. These use zero API budget.
+Only run production Stage 3 once all 70 tests pass and all CWE dry runs look correct.
+If a tier-1 bug is found after production Stage 3: patch the bug, then re-run ONLY for that CWE using --cwe-filter.
+This costs ~$8-15 for a single-CWE re-run instead of $85-120 for a full re-run.
+? VERIFICATION
+Before starting production: python -m pytest tests/test_cfa_*.py ? ALL 70 tests must PASS.
+If any test fails: STOP. Fix the tier. Re-run tests. Never start production with failing tests.
+4. High Risks ? Full Detail
+R-08  [HIGH]  CoT Output Text Pollutes extract_c_code ? Reasoning Appears in CFA Code
+? PROBLEM
+Tier 3 prompts ask the LLM to 'think step by step'. The response contains reasoning text BEFORE the code.
+Example response: 'STEP 1: The vulnerability is at line 15... STEP 2: Fix strategy... STEP 3: [code]'.
+If extract_c_code() uses only markdown fence extraction (```c ... ```), it may extract the reasoning text as code.
+A CFA that starts with 'STEP 1: The vulnerability...' will fail Gate 3 (gcc syntax error) ? but wastes an API call.
+More dangerous: if the CoT reasoning happens to contain C-like syntax, it may PASS Gate 3 with wrong content.
+? IMPACT
+Every Tier 3+ attempt that extracts CoT text as code = 1 wasted API call + a Gate 3 failure.
+With 22K samples at 7 attempts each: if 30% of attempts fail this way = ~46K wasted API calls = ~$37 wasted.
+? MITIGATION
+All Tier 3/4/5 prompts MUST include these exact markers in the prompt instruction: [FIXED_CODE_START] and [FIXED_CODE_END].
+extract_c_code_v2() FIRST tries to find [FIXED_CODE_START]...[FIXED_CODE_END]. If found: use that content only.
+THEN tries markdown fence extraction. THEN falls back to finding first function signature.
+Test: manually construct a response with CoT reasoning + [FIXED_CODE_START] marker. Verify only code after marker is extracted.
+? VERIFICATION
+In CFA-T2/T3/T4 test files: add a test that passes a string containing 'STEP 1:... STEP 2:... [FIXED_CODE_START]void f(){...}[FIXED_CODE_END]' and verifies only 'void f(){...}' is returned.
+R-09  [HIGH]  Gate 5 Too Restrictive ? Valid Custom Fix Signatures Rejected
+? PROBLEM
+Gate 5 checks that a fix signature pattern from FIX_SIGNATURES is present in the CFA.
+Example: FIX_SIGNATURES['CWE-120'] includes 'strncpy' and 'snprintf'.
+But a valid fix might use a custom wrapper: safe_copy(dst, src, sizeof(dst)) ? not in the signature list.
+Gate 5 would mark this as 'no_fix_signature' and REJECT it even though Gate 4 (vuln pattern removed) passed.
+ALSO: the LLM might correctly fix CWE-120 by using a completely different strategy (e.g., dynamic bounds check with error return) that doesn't match any known signature.
+? IMPACT
+Valid, high-quality CFAs rejected. CFA count per vulnerable sample drops below target ratio.
+Pre-training audit may fail the fix_signature_rate threshold for some CWEs.
+Paper claim of 'structural validation improves CFA quality' is weakened if the gate is over-rejecting.
+? MITIGATION
+Gate 5 MUST be a SOFT gate: if FIX_SIGNATURES check fails, set quality_score=0.6 (not 0.0), do NOT reject.
+Return is_valid=True with quality_score=0.6. The CFA still enters the dataset but with lower confidence.
+In StreamGuardLossTierWeighted: samples with quality_score=0.6 get weighted contrastive loss weight.
+Only Gates 1, 2, 3, 4, and 6 are HARD rejections. Gate 5 and Gate 7 are SOFT/optional.
+? VERIFICATION
+After building CFA-F1: test that Gate 5 failure returns (True, '', code, 0.6) not (False, ..., '', 0.0).
+8 tests in test_cfa_foundation.py explicitly test Gate 5 soft behavior.
+R-14  [HIGH]  Near-Identical Tier 1 CFAs Bypass Stage 2 Dedup and Corrupt HDF5
+? PROBLEM
+Tier 1 AST rules are deterministic. Two SARD CWE-134 functions with identical structure produce identical CFAs.
+Stage 2 MinHash dedup runs on deduped/samples.jsonl BEFORE Stage 3. It does NOT run again on with_cfa/.
+The with_cfa/ output may contain thousands of near-identical Tier 1 CFAs (especially for CWE-134 printf fixes).
+These all get unique IDs (UUID4) so Stage 6 writes them all to HDF5 without detecting duplicates.
+? IMPACT
+HDF5 size bloat: 1,000 near-identical CFAs for CWE-134 wastes ~40MB in HDF5.
+Training: the model sees essentially the same example 1,000 times. This overfits the GNN to CWE-134 printf fix pattern.
+Per-CWE F1 on other CWEs drops as training budget is wasted on repeated identical examples.
+? MITIGATION
+After Stage 3 completes: run Level 4 MinHash LSH on with_cfa/samples.jsonl to remove near-duplicates among CFA samples.
+CRITICAL: group pairs before dedup ? if one side of a CFA pair is removed, remove both (same pair_id).
+Add a post-Stage-3 dedup step in the pipeline: stage3_post_dedup.py.
+Threshold: Jaccard ? 0.90 (slightly stricter than Stage 2's 0.85, since CFA pairs should be slightly more unique).
+? VERIFICATION
+After Stage 3 dry run on 100 CWE-134 samples: count unique CFAs. If >30% are near-duplicates (Jaccard ? 0.90): post-dedup is needed.
+5. Medium & Low Risks ? Summary
+ID
+Risk Title
+Mitigation
+Sev
+R-10
+Tier 1 multi-dim array: sizeof returns row size not buffer size
+Detect 2D array subscript in AST. If found: return [] from tier1, escalate to Tier 2. Add test: verify 2D array case escalates.
+HIGH
+R-11
+Gate 6 false negative: indirect taint path not caught by regex
+For accepted injection CWE CFAs: optionally run Joern taint (--verify-taint flag). Downgrades quality_score=0.5, flags for review.
+HIGH
+R-12
+Exemplar DB built from SARD synthetic only (no real CVEs)
+Assert: count_real_pairs(cwe='CWE-416', source in ['cve','repo','github_advisory']) >= 20 BEFORE building DB.
+HIGH
+R-13
+Tier 4 selects wrong CWE-416 subtype exemplars
+Categorize exemplars: simple_uaf / function_ptr_uaf / multithreaded_uaf. Match on subtype during selection.
+HIGH
+R-15
+API 529 / rate limit mid-run ? checkpoint incomplete
+tenacity retry 5? on RateLimitError. Checkpoint every 200 samples. On 529: sleep 60s + jitter before retry.
+HIGH
+R-16
+CWE-416 CPG diff count > 10 ? Gate 7 rejects valid 'add null after each free' CFAs
+CWE_CPG_DIFF_LIMIT['CWE-416'] = 20 (not 10). Multiple NULL assignments = multiple CPG nodes.
+MED
+R-17
+Long functions >100 lines: LLM focuses on wrong part
+For functions >100 lines: apply APPATCH-style slice. Send vulnerability-context slice (20-50 lines) to LLM. Re-integrate fix.
+MED
+R-18
+Burst retries trigger secondary rate limit (too many calls in short window)
+Add jitter: time.sleep(random.uniform(0.3, 1.5)) between each sample's first attempt, regardless of success.
+MED
+R-19
+Wrong CWE_TIER_MAP assignment ? silent quality degradation
+CWE_TIER_MAP is frozen in stage3_cfa.py. Never change without full Stage 3 re-run + audit.
+MED
+R-20
+pair_id incorrectly assigned ? both CFA sides have same label
+finalize_pairs() after run_stage3_tiered(): scan all pair_ids, verify each has exactly one label=0 and one label=1.
+MED
+R-21
+cfa_quality_report.json not written ? audit skips all CFA quality checks
+Assert cfa_quality_report.json exists before pre_training_audit.py runs. Log WARN if missing.
+MED
+R-22
+Checkpoint corrupted on kill -9
+Atomic write: write to .tmp, os.replace(). On startup: delete any *.tmp in checkpoint dir.
+MED
+R-23
+CWE-79 exemplar DB empty ? Tier 4 falls back to near zero-shot
+If real_pairs(CWE-79) < 20: use Tier 3 only for CWE-79. Log warning. Accept lower compile rate (68%).
+LOW
+R-24
+Tier 1 fix changes semantics on multi-call functions (loop with strcpy)
+Semantic equivalence check on Tier 1 output: compile + run with 3 safe test inputs. If output differs: reject.
+LOW
+R-25
+Anthropic API key expires mid-run
+Add 401 handler in LLM client: log CRITICAL error, raise SystemExit (do not retry 401s). Check key before starting.
+LOW
+R-26
+Near-identical Tier 1 CFAs pass to Stage 4 without dedup
+Run stage3_post_dedup.py after Stage 3 completes. Jaccard threshold 0.90. Preserve pair integrity.
+LOW
+6. Go / No-Go Gates Before Production Stage 3
+All conditions below must be met before running the production Stage 3. If any fails: DO NOT run production. Fix the issue, re-verify, then proceed.
+Gate
+Condition
+Verification Command
+If FAIL
+G1
+All 70 CFA tests pass (test_cfa_foundation + all 5 tiers + integration)
+python -m pytest tests/test_cfa_*.py
+Fix failing tests. Do not proceed.
+G2
+SARD skip verified: zero sard_cfa samples in dry run of 50 mixed samples
+Grep for 'sard_cfa' in dry run output ? must be zero
+Fix SARD skip check in orchestrator
+G3
+Pointer param detection works: CWE-120 sample with char *dst escalates to Tier 2
+Dry run on known pointer-param sample ? verify tier=2 in output
+Fix fix_cwe120_ast() AST check
+G4
+Gate 5 is SOFT: missing fix signature gives quality_score=0.6, NOT rejection
+Test with custom fix function not in FIX_SIGNATURES ? must get (True, score=0.6)
+Fix Gate 5 to be soft
+G5
+[FIXED_CODE_START] parsing works: CoT text before marker is stripped
+Test extract_c_code_v2 with CoT reasoning + marker ? verify only code after marker
+Fix extract_c_code_v2
+G6
+Exemplar DB exists with ?20 real pairs for CWE-416 and CWE-119
+python cfa_exemplar_db.py --verify
+Build exemplar DB from Phase 2 real CVE data
+G7
+Tier 4 exemplar prompt verified: exemplar code appears in prompt
+Stage 3 dry run 5 CWE-416 samples with --debug-prompts
+Check exemplar_db.select_exemplars()
+G8
+API key valid and budget available
+python -c "from anthropic import Anthropic; c=Anthropic(); print('OK')"
+Renew API key
+G9
+Input file is with_cfa/, NOT deduped/ (Stage 3 reads from deduped/, writes to with_cfa/)
+Check CLI --input path is set to deduped/samples.jsonl
+Verify input/output paths
+G10
+Checkpoint directory exists and is writable
+ls -la training/checkpoints/ OR mkdir -p training/checkpoints
+Create checkpoint dir
+G11
+Disk space: ?10GB free for with_cfa/ output (40K+ samples ? avg 2KB)
+df -h training/data/
+Free disk space
+? THE SINGLE MOST IMPORTANT RULE
+Never run Stage 3 production with a failing test. 70 tests exist for one reason:
+to catch bugs that would corrupt your training data silently. A silent bug in Stage 3
+does not show up until Phase 4 training ? after 208 hours of Joern CPG construction
+and 27 minutes of Colab GPU embedding. At that point, the only fix is a full Stage 3 re-run.
+The 70 tests take ~3 minutes to run. Run them every time.
+StreamGuard CFA Generation Risk Analysis  |  v1.0  |  March 2026
