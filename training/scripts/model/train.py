@@ -504,10 +504,14 @@ def train(config: dict):
     tokenizer = AutoTokenizer.from_pretrained(config["base_model"])
 
     # ── Code lookup (R-19) ────────────────────────────────────────
+    # Resolve JSONL paths relative to the repo root (handles Colab where
+    # the working directory may differ from the repo location).
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _repo_root = os.path.abspath(os.path.join(_script_dir, "..", "..", ".."))
     code_lookup = load_code_lookup([
-        "training/data/processed/with_cfa/samples.jsonl",
-        "training/data/processed/deduped/samples.jsonl",
-        "training/data/processed/cleaned/samples.jsonl",
+        os.path.join(_repo_root, "training/data/processed/with_cfa/samples.jsonl"),
+        os.path.join(_repo_root, "training/data/processed/deduped/samples.jsonl"),
+        os.path.join(_repo_root, "training/data/processed/cleaned/samples.jsonl"),
     ])
     print(f"Code lookup: {len(code_lookup)} samples loaded")
 
