@@ -818,6 +818,7 @@ def train(config: dict):
                     break
 
         # ── Test set evaluation ONCE (R-01) ───────────────────────
+        test_metrics = {}
         test_h5 = config.get("test_h5")
         if test_h5 and os.path.exists(test_h5) and best_ckpt_path.exists():
             print(f"\n--- Test set evaluation (ONCE, best checkpoint) ---")
@@ -858,7 +859,7 @@ def train(config: dict):
 
     print(f"\nTraining complete. Best val F1: {best_val_f1:.4f}")
     print(f"Checkpoints: {ckpt_dir}")
-    return best_val_f1
+    return best_val_f1, test_metrics
 
 
 # ---------------------------------------------------------------------------
@@ -929,7 +930,7 @@ def main():
           f"epochs={config['epochs']}, dry_run={config.get('dry_run', False)}")
     print()
 
-    train(config)
+    best_val_f1, test_metrics = train(config)
 
 
 if __name__ == "__main__":

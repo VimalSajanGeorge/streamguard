@@ -93,6 +93,15 @@ class StreamGuardModel(nn.Module):
             for _ in range(self.GGNN_LAYERS)
         ])
 
+        # Config B: Type-blind single GatedGraphConv per layer (R-15 fix).
+        # Uses dedicated weights separate from the type-aware convs.
+        # All edges processed equally regardless of edge_attr type.
+        if not type_aware_edges:
+            self.single_conv = nn.ModuleList([
+                GatedGraphConv(out_channels=self.GGNN_HIDDEN, num_layers=1)
+                for _ in range(self.GGNN_LAYERS)
+            ])
+
         # Per-layer aggregation: concat 4 type outputs (1024-d) → 256-d
         self.edge_agg = nn.ModuleList([
             nn.Linear(self.GGNN_HIDDEN * self.NUM_EDGE_TYPES, self.GGNN_HIDDEN)
@@ -194,11 +203,11 @@ class StreamGuardModel(nn.Module):
 
         for layer_idx in range(self.GGNN_LAYERS):
             if not self.type_aware_edges:
-                # Config B: type-blind GGNN — use edge_type 0 conv on ALL edges
+                # Config B: type-blind GGNN — dedicated single conv on ALL edges (R-15)
                 if edge_index.size(1) == 0:
                     h_new_raw = torch.zeros_like(h)
                 else:
-                    h_new_raw = self.edge_type_convs[layer_idx][0](h, edge_index)
+                    h_new_raw = self.single_conv[layer_idx](h, edge_index)
                 # Pad to 4-type concat width so edge_agg input shape matches
                 type_outputs = [h_new_raw] + [torch.zeros_like(h)] * (self.NUM_EDGE_TYPES - 1)
             else:
